@@ -1,0 +1,11 @@
+# Opt-in local hooks: `pip install pre-commit && pre-commit install`.
+# The hook is the repository's own script (standard library only), so nothing is
+# downloaded to run it. CI runs the same scan on every push (ci.yml, secret-scan).
+repos:
+  - repo: local
+    hooks:
+      - id: scan-secrets
+        name: scan for API keys, tokens and credential files
+        entry: python scripts/scan_secrets.py
+        language: system
+        pass_filenames: true

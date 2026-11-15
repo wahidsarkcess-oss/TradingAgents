@@ -4,6 +4,7 @@ from typing import Any
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from .base_client import BaseLLMClient, normalize_content
+from .retrying import call_with_budget_retries
 from .validators import validate_model
 
 _GEMINI_VERSION = re.compile(r"^gemini-(\d+)\.(\d+)")
@@ -27,8 +28,19 @@ class NormalizedChatGoogleGenerativeAI(ChatGoogleGenerativeAI):
     This normalizes to string for consistent downstream handling.
     """
 
+    # Set under budget limits: the SDK's own retries are off and this many are
+    # made here, each approved by the budget first. None: the SDK retries as before.
+    budget_retries: int | None = None
+
     def invoke(self, input, config=None, **kwargs):
         return normalize_content(super().invoke(input, config, **kwargs))
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        parent = super()._generate
+        if self.budget_retries is None:
+            return parent(messages, stop, run_manager, **kwargs)
+        return call_with_budget_retries(lambda: parent(messages, stop, run_manager, **kwargs),
+                                        self.budget_retries)
 
 
 # The read timeout the OpenAI and Anthropic SDKs use by default.
@@ -71,6 +83,13 @@ class GoogleClient(BaseLLMClient):
             if thinking_level == "minimal" and not _accepts_minimal_thinking(self.model):
                 thinking_level = "low"
             llm_kwargs["thinking_level"] = thinking_level
+
+        # Under budget limits the google-genai SDK makes exactly one attempt
+        # (attempts=1) and the retries happen in _generate, through the budget.
+        budget_retries = self.kwargs.get("budget_controlled_retries")
+        if budget_retries is not None:
+            llm_kwargs["max_retries"] = 1
+            llm_kwargs["budget_retries"] = int(budget_retries)
 
         return NormalizedChatGoogleGenerativeAI(**llm_kwargs)
 

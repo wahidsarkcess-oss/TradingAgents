@@ -9,6 +9,7 @@ from pathlib import Path
 
 import typer
 from rich.live import Live
+from rich.markup import escape
 
 from cli.display import (
     ANALYST_ORDER,
@@ -31,6 +32,7 @@ from tradingagents.graph.analyst_execution import (
     build_analyst_execution_plan,
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.logsafe import redact
 
 
 def _run_directory(config: dict, ticker: str, trade_date: str) -> Path:
@@ -451,7 +453,7 @@ def _offer_reports(final_state, graph, ticker, save=None, show=None, html=None):
             console.print(f"\n[green]✓ Report saved to:[/green] {save_path.resolve()}")
             console.print(f"  [dim]Complete report:[/dim] {report_file.name}")
         except Exception as e:
-            console.print(f"[red]Error saving report: {e}[/red]")
+            console.print(f"[red]Error saving report: {escape(redact(str(e)))}[/red]")
         if saved and html:
             page = (save_path / "complete_report.html").resolve()
             console.print(f"  [dim]HTML report:[/dim] {page.name}")

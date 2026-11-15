@@ -9,6 +9,7 @@ import pandas as pd
 
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.market import get_closes
+from tradingagents.llm_clients.budget import LLMBudgetExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,9 @@ class Settlement:
 
     settled: list[tuple[str, str]] = field(default_factory=list)        # (ticker, date)
     failed: list[tuple[str, str, str]] = field(default_factory=list)    # (ticker, date, reason)
+    # Settled with their outcome but no reflection, because a budget refused the
+    # reflection call: scored like any settled decision, and reported.
+    unreflected: list[tuple[str, str, str]] = field(default_factory=list)  # (ticker, date, reason)
 
 
 def settle_pending(ticker: str, memory_log, reflector, config: dict, wait: bool = True) -> Settlement:
@@ -170,6 +174,16 @@ def settle_pending(ticker: str, memory_log, reflector, config: dict, wait: bool 
                     benchmark_name=benchmark,
                     holding_days=days,
                 )
+            except LLMBudgetExceeded as exc:
+                # The outcome is known; only the commentary was refused. Record the
+                # outcome so the decision is scored, with no lesson text, and say so.
+                logger.warning("Reflection for %s on %s was refused by the LLM budget: %s",
+                               ticker, entry["date"], exc)
+                if memory_log.update_with_outcome(ticker, entry["date"], raw, alpha, days, "",
+                                                  resolution_date=resolution_date):
+                    result.settled.append((ticker, entry["date"]))
+                    result.unreflected.append((ticker, entry["date"], f"reflection refused: {exc}"))
+                continue
             except Exception as exc:
                 # Reflection calls a provider: a transient failure leaves the entry
                 # pending for the next pass rather than stopping the analysis.
@@ -193,4 +207,5 @@ def settle_all_pending(memory_log, reflector, config: dict, wait: bool = True) -
         done = settle_pending(ticker, memory_log, reflector, config, wait=wait)
         result.settled.extend(done.settled)
         result.failed.extend(done.failed)
+        result.unreflected.extend(done.unreflected)
     return result

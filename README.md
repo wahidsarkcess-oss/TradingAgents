@@ -328,6 +328,22 @@ The CLI takes the same content as a JSON file: `tradingagents --portfolio my_boo
 
 An empty `positions` list means a flat book, which is different from passing nothing. A run without a portfolio is never treated as flat.
 
+## Spending limits and cloud runs
+
+Every LLM call of an analysis draws on one shared budget, checked before the request is sent. All limits are off unless you set them:
+
+```bash
+TRADINGAGENTS_MAX_LLM_CALLS=40          # calls per analysis, failed requests and retries included
+TRADINGAGENTS_MAX_TOKENS=4096           # output tokens per call
+TRADINGAGENTS_MAX_TOKENS_PER_RUN=200000 # provider-reported tokens per analysis
+TRADINGAGENTS_MAX_COST_PER_RUN=0.50     # estimated USD for the analysis and its reflections together
+TRADINGAGENTS_MAX_COST_PER_DAY=5        # estimated USD per UTC day, across runs
+```
+
+A refused call ends the run with exit code 3. With every limit off the budget only counts: nothing is refused or hooked and clients are built as before. With limits on, provider retries are checked like calls before they are sent (the OpenAI and Anthropic SDKs' retries are intercepted; Google's and Bedrock's are switched off and done by the TradingAgents wrappers through the budget), reflections on past decisions use their own call and token allowance (`TRADINGAGENTS_MAX_REFLECTION_CALLS`, `_TOKENS`; unset, the analysis values as a separate pool), and concurrent analyses or settlement passes on one graph each have their own account. A checkpointed analysis keeps its usage, in-flight reservations included, across a crash and resume, and a checkpoint can be resumed by one process at a time. `TRADINGAGENTS_MAX_EXTERNAL_REQUESTS` caps TypeSafe screening requests per run. Cost limits are estimates from a pricing file you fill in from your provider's pricing page (template: `deploy/cloud/pricing.example.json`, with cache-write and long-context tiers), and they fail closed: with one set, a run does not start unless that file is valid, recent and prices every model in use, `TRADINGAGENTS_MAX_TOKENS` is set, and every model runs on a supported provider whose constructed client targets its official endpoint (`*_BASE_URL` overrides and gateways are refused; `chatgpt`, `ollama`, `openai_compatible` and `bedrock` are not supported for cost limits). Spend is recorded per UTC day in `<cache dir>/spend/`, with reservations shared across processes. Each saved state log records `llm_usage`, which keeps provider-reported tokens, the estimated cost and any provider-reported cost apart. `tradingagents backtest ... --max-cost 10` caps a whole sweep. These are local estimates, and the usage records and daily ledger are local files that anyone with write access can edit, so they are not tamper-resistant; set a hard limit in your provider's billing settings too.
+
+`deploy/cloud/` runs one unattended analysis in a hardened container: keys come through a Docker secret, output is redacted, there is no update check and no TTY, and nothing is scheduled. See [deploy/cloud/README.md](deploy/cloud/README.md). Secrets are kept out of commits by `scripts/scan_secrets.py`, which runs in CI and as an opt-in pre-commit hook (`pre-commit install`). It prints every exemption it applies: the inline `scan-secrets: allow` marker (honoured only under `tests/`) and reviewed findings in `.scan-secrets-allow`, each bound to a fingerprint of its value.
+
 ## Persistence and Recovery
 
 TradingAgents persists two kinds of state across runs.

@@ -13,3 +13,14 @@ results
 eval_results
 Dockerfile
 docker-compose.yml
+# Secrets and local state never enter the build context or the image.
+data
+secrets
+**/secrets.env
+**/*.secrets.env
+**/chatgpt-auth.json
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+deploy/cloud/cloud.env

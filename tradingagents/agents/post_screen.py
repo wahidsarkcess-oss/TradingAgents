@@ -12,6 +12,7 @@ Configured by TypeSafe's own SDK variables, ``TYPESAFE_API_KEY``,
 block says screening was unavailable.
 """
 
+import contextvars
 import logging
 import os
 import random
@@ -21,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 from tradingagents.agents.context import resolve_instrument_identity
+from tradingagents.llm_clients.budget import LLMBudgetExceeded, meter_external_requests
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,9 @@ def system_one(state, questions: dict) -> dict[str, dict]:
         if attempt:
             time.sleep(retry_after if retry_after is not None else backoff * random.uniform(0.8, 1.2))
             backoff *= 2
+        # Every attempt is a paid request: counted in the run's budget first, and
+        # refused (LLMBudgetExceeded) under a cost limit or past the request cap.
+        meter_external_requests("TypeSafe screening", 1)
         try:
             response = requests.post(_url(), json=body, headers=headers, timeout=_TIMEOUT)
         except requests.RequestException as exc:
@@ -142,6 +147,13 @@ def jev_screen(ticker: str):
     instrument = f"{name} ({ticker})" if name else ticker
 
     def screen(posts: list[str]) -> tuple[list[bool], str]:
+        # TypeSafe is a paid API outside the LLM clients: under a cost limit (which
+        # cannot price it) nothing is sent; otherwise each attempt is counted, and
+        # capped by max_external_requests_per_run.
+        try:
+            meter_external_requests("TypeSafe screening", 0)
+        except LLMBudgetExceeded as exc:
+            return _unscreened(instrument, posts, f"skipped: {exc}")
         try:
             answers = _ask_each(instrument, posts)
             keep = [a["about"]["noul"] >= _OFF_TOPIC_BELOW for a in answers]
@@ -150,6 +162,8 @@ def jev_screen(ticker: str):
             return _unscreened(instrument, posts, "malformed response")
         except TypeSafeError as exc:
             return _unscreened(instrument, posts, str(exc))
+        except LLMBudgetExceeded as exc:
+            return _unscreened(instrument, posts, f"stopped: {exc}")
         counts = ", ".join(f"{stances.count(s)} {s}" for s in ("bullish", "bearish", "neutral", "unclear"))
         return keep, (
             f"Screened by Jev: {len(stances)} of the {len(posts)} posts fetched are about "
@@ -170,8 +184,10 @@ def _ask_each(instrument: str, posts: list[str]) -> list[dict]:
     answers: list = [None] * len(posts)
     pool = ThreadPoolExecutor(max_workers=_WORKERS)
     try:
+        # Each request runs in the caller's context, so it is metered in the run's budget.
         futures = {
-            pool.submit(system_one, {"instrument": instrument, "post": post}, QUESTIONS): i
+            pool.submit(contextvars.copy_context().run, system_one,
+                        {"instrument": instrument, "post": post}, QUESTIONS): i
             for i, post in enumerate(posts)
         }
         for future in as_completed(futures):

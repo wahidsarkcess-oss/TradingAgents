@@ -2,6 +2,7 @@ import os
 from typing import Any
 
 from .base_client import BaseLLMClient, normalize_content
+from .retrying import call_with_budget_retries
 from .validators import validate_model
 
 # Bedrock has no global default region; us-west-2 hosts the broadest model set.
@@ -29,10 +30,23 @@ def _bedrock_class():
         ) from exc
 
     class NormalizedChatBedrockConverse(ChatBedrockConverse):
-        """ChatBedrockConverse with normalized (string) content output."""
+        """ChatBedrockConverse with normalized (string) content output.
+
+        Under budget limits ``budget_retries`` is set: botocore makes one attempt
+        and the retries happen here, each approved by the budget first.
+        """
+
+        budget_retries: int | None = None
 
         def invoke(self, input, config=None, **kwargs):
             return normalize_content(super().invoke(input, config, **kwargs))
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            parent = super()._generate
+            if self.budget_retries is None:
+                return parent(messages, stop, run_manager, **kwargs)
+            return call_with_budget_retries(lambda: parent(messages, stop, run_manager, **kwargs),
+                                            self.budget_retries)
 
     _BEDROCK_CLASS = NormalizedChatBedrockConverse
     return _BEDROCK_CLASS
@@ -69,6 +83,15 @@ class BedrockClient(BaseLLMClient):
         for key in ("temperature", "max_tokens", "max_retries", "callbacks"):
             if key in self.kwargs:
                 llm_kwargs[key] = self.kwargs[key]
+        budget_retries = self.kwargs.get("budget_controlled_retries")
+        if budget_retries is not None:
+            # botocore retries inside the AWS SDK, out of the budget's sight: one
+            # attempt there, the retries in _generate.
+            from botocore.config import Config
+
+            llm_kwargs.pop("max_retries", None)
+            llm_kwargs["config"] = Config(retries={"max_attempts": 1, "mode": "standard"})
+            llm_kwargs["budget_retries"] = int(budget_retries)
         return chat_cls(**llm_kwargs)
 
     def validate_model(self) -> bool:

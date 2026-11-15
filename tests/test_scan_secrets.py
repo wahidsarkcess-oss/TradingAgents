@@ -57,8 +57,12 @@ def test_key_assignments_are_flagged_unless_blank_or_a_placeholder(line, flagged
 
 
 @pytest.mark.unit
-def test_a_marked_example_line_is_exempt():
-    assert scan.scan_line(FAKES["AWS access key id"] + "  # scan-secrets: allow") == []
+def test_a_marked_example_line_is_exempt_only_under_tests():
+    line = FAKES["AWS access key id"] + "  # scan-secrets: allow"
+    [in_tests] = scan._findings_on(line, "tests/test_x.py", 1)
+    [elsewhere] = scan._findings_on(line, "tradingagents/x.py", 1)
+    assert in_tests.exempt == "inline marker"
+    assert elsewhere.exempt is None and "marker ignored" in elsewhere.kind
 
 
 @pytest.mark.unit
@@ -90,9 +94,13 @@ def test_the_repository_holds_no_secrets():
     os.chdir(ROOT)
     try:
         findings = [f for path in scan.tracked_files() for f in scan.scan_file(path)]
+        reviewed, invalid = scan.load_allowlist()
     finally:
         os.chdir(cwd)
-    assert findings == []
+    assert invalid == []
+    assert [str(f) for f in findings if not f.exempt and f.key not in reviewed] == []
+    # Every exemption is a test fixture: none outside tests/.
+    assert all(scan.in_tests(f.path) for f in findings if f.exempt)
 
 
 @pytest.mark.unit

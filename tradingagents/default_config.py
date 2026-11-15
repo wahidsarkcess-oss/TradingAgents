@@ -32,6 +32,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MAX_COST_PER_DAY":     "max_cost_per_day_usd",
     "TRADINGAGENTS_MAX_REFLECTION_CALLS":  "max_reflection_calls_per_run",
     "TRADINGAGENTS_MAX_REFLECTION_TOKENS": "max_reflection_tokens_per_run",
+    "TRADINGAGENTS_MAX_EXTERNAL_REQUESTS": "max_external_requests_per_run",
     "TRADINGAGENTS_PRICING_FILE":         "pricing_file",
     "TRADINGAGENTS_MAX_PRICING_AGE_DAYS": "max_pricing_age_days",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
@@ -143,7 +144,11 @@ def build_default_config() -> dict:
         # above as a separate pool. Their cost counts in the session and daily totals.
         "max_reflection_calls_per_run": None,
         "max_reflection_tokens_per_run": None,
-        # Cost limits are estimates from pricing_file (USD per 1M tokens, copied
+        # Paid requests outside the LLM clients (TypeSafe screening), per run.
+        # Under a cost limit none are made at all, since no pricing covers them.
+        "max_external_requests_per_run": None,
+        # max_cost_per_run_usd is one ceiling for the analysis and its reflections
+        # together. Cost limits are estimates from pricing_file (USD per 1M tokens, copied
         # from the provider's pricing page) and fail closed: with a cost limit set,
         # a run will not start unless that file is valid, no older than
         # max_pricing_age_days, and prices every model in use; max_tokens is set;

@@ -16,6 +16,7 @@ cell rather than a position carried forward.
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import logging
 from collections.abc import Callable
@@ -224,24 +225,25 @@ def run_backtest(
             result.failures.append((ticker, date, str(exc)))
 
     # Settlement runs at the start of the next run for a ticker, so each ticker's
-    # last cell would stay pending without this pass. It starts a fresh budget
-    # account, so it never inherits the allowance the last cell left over.
-    if budget is not None:
-        budget.begin_run()
-    for ticker in tickers:
-        try:
-            settlement = graph.settle_pending(ticker)
-            result.settlement_failures.extend(
-                (failed_ticker, f"{date}: {reason}")
-                for failed_ticker, date, reason in settlement.failed
-            )
-            result.unreflected.extend(
-                (unreflected_ticker, f"{date}: {reason}")
-                for unreflected_ticker, date, reason in getattr(settlement, "unreflected", [])
-            )
-        except Exception as exc:  # reflection calls an LLM; one failure is not the sweep's
-            logger.warning("Settling %s failed: %s", ticker, exc)
-            result.settlement_failures.append((ticker, str(exc)))
+    # last cell would stay pending without this pass. The whole pass shares one
+    # independent budget account, so it never inherits the allowance the last
+    # cell left over and its reflection allowance covers the pass, not each ticker.
+    session = graph.settlement_session() if hasattr(graph, "settlement_session") else contextlib.nullcontext()
+    with session:
+        for ticker in tickers:
+            try:
+                settlement = graph.settle_pending(ticker)
+                result.settlement_failures.extend(
+                    (failed_ticker, f"{date}: {reason}")
+                    for failed_ticker, date, reason in settlement.failed
+                )
+                result.unreflected.extend(
+                    (unreflected_ticker, f"{date}: {reason}")
+                    for unreflected_ticker, date, reason in getattr(settlement, "unreflected", [])
+                )
+            except Exception as exc:  # reflection calls an LLM; one failure is not the sweep's
+                logger.warning("Settling %s failed: %s", ticker, exc)
+                result.settlement_failures.append((ticker, str(exc)))
     result.usage = graph.usage(session=True) if budget is not None else {}
     return result
 

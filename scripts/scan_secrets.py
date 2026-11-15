@@ -8,29 +8,39 @@ hook (``.pre-commit-config.yaml``), in CI, or by hand.
     python scripts/scan_secrets.py FILE [FILE...] # these files (pre-commit passes them)
     python scripts/scan_secrets.py --history      # every line ever added, on every branch
 
-It reports the file, line and kind of each finding, never the value itself, and
-lists the files it skipped as too large to scan. ``--history`` covers only the
-commits present locally: in a shallow clone (CI's default checkout) it warns
-that older history was not scanned; run it in a full clone for a complete pass.
-It is a heuristic first line, not a guarantee: a credential with no recognisable
-shape outside a NAME=value or key: "value" assignment is not found.
-A line that must contain a credential-shaped string (a documented example, a
-test fixture) can be exempted with the marker ``scan-secrets: allow``.
+Each finding names the file, line and kind, and a fingerprint of the matched
+value (the first 16 hex digits of its SHA-256), never the value itself. Files of
+any size are scanned, line by line; UTF-8, UTF-16 and UTF-32 (with or without a
+byte-order mark) are decoded; other files containing NUL bytes are reported as
+skipped binaries.
+
+Exemptions, every one printed in the output so a reviewer sees it:
+
+- the inline marker ``scan-secrets: allow`` on the line, honoured only in files
+  under a ``tests/`` directory (test fixtures);
+- ``.scan-secrets-allow``: reviewed findings, one per line as printed, each bound
+  to its fingerprint, so a different value at the same place is still reported.
+
+``--history`` covers only the commits present locally; in a shallow clone (CI's
+default checkout) it warns that older history was not scanned. The scanner is a
+heuristic first line, not a guarantee: a credential with no recognisable shape
+outside a NAME=value or key: "value" assignment is not found.
 """
 
 from __future__ import annotations
 
 import argparse
+import codecs
+import hashlib
 import re
 import subprocess
 import sys
-from pathlib import Path
+from collections.abc import Iterator
+from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 ALLOW_MARKER = "scan-secrets: allow"
-# Reviewed false positives that cannot carry the marker (lines already in history):
-# one finding per line, exactly as printed. It holds locations, never values.
 ALLOWLIST_FILE = ".scan-secrets-allow"
-MAX_BYTES = 2_000_000
 
 # Files that hold credentials and must never be committed, whatever they contain.
 FORBIDDEN_NAMES = {
@@ -88,6 +98,33 @@ PLACEHOLDER_WORD = re.compile(
     r"(?i)placeholder|dummy|example|fake|sample|test|your[-_]|xxxx|redacted|changeme|password|secret|\$|\{")
 
 
+def fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+class Finding(NamedTuple):
+    path: str
+    kind: str
+    value: str
+    line: int | None = None
+    commit: str | None = None
+    exempt: str | None = None      # why it does not fail the scan, printed regardless
+
+    @property
+    def fp(self) -> str:
+        return fingerprint(self.value)
+
+    @property
+    def key(self) -> tuple:
+        """What a reviewed allowlist entry binds to: place, kind and the value's fingerprint."""
+        return (self.commit or "", self.path, self.kind, self.fp)
+
+    def __str__(self) -> str:
+        where = f"{self.commit} {self.path}" if self.commit else (
+            f"{self.path}:{self.line}" if self.line is not None else self.path)
+        return f"{where}: {self.kind} [fp:{self.fp}]"
+
+
 def _looks_like_a_secret(value: str) -> bool:
     """A literal worth flagging: not a placeholder, and mixing letters with digits."""
     return (not PLACEHOLDER.match(value) and not PLACEHOLDER_WORD.search(value)
@@ -95,7 +132,7 @@ def _looks_like_a_secret(value: str) -> bool:
 
 
 def _forbidden(path: str) -> str | None:
-    name = Path(path).name
+    name = PurePosixPath(path.replace("\\", "/")).name
     if (name in FORBIDDEN_NAMES or name.endswith(FORBIDDEN_SUFFIXES)
             or any(p.search(name) for p in FORBIDDEN_PATTERNS)):
         return f"credential file '{name}' must not be committed"
@@ -104,51 +141,103 @@ def _forbidden(path: str) -> str | None:
     return None
 
 
-def scan_line(line: str) -> list[str]:
-    """The kinds of secret found on one line (empty when clean or exempted)."""
-    if ALLOW_MARKER in line:
-        return []
-    found = [kind for kind, pattern in KEY_PATTERNS.items() if pattern.search(line)]
+def in_tests(path: str) -> bool:
+    """Whether ``path`` lies under a ``tests/`` directory, where inline exemptions count."""
+    return "tests" in PurePosixPath(path.replace("\\", "/")).parts[:-1]
+
+
+def scan_line(line: str) -> list[tuple[str, str]]:
+    """(kind, matched value) for each secret on one line, ignoring any marker."""
+    found = []
+    for kind, pattern in KEY_PATTERNS.items():
+        match = pattern.search(line)
+        if match:
+            found.append((kind, match.group(0)))
     match = ASSIGNMENT.match(line)
     if match and len(match["value"]) >= 8 and not PLACEHOLDER.match(match["value"]):
-        found.append(f"value assigned to {match['name']}")
+        found.append((f"value assigned to {match['name']}", match["value"]))
     elif not match:
         quoted = QUOTED_ASSIGNMENT.search(line)
         if quoted and _looks_like_a_secret(quoted["value"]):
-            found.append(f"literal assigned to {quoted['name']}")
+            found.append((f"literal assigned to {quoted['name']}", quoted["value"]))
     url = URL_CREDENTIALS.search(line)
     if url and not PLACEHOLDER_WORD.search(url["password"]):
-        found.append("credentials in a URL")
+        found.append(("credentials in a URL", url["password"]))
     return found
 
 
-def scan_text(text: str, label: str) -> list[str]:
-    return [f"{label}:{number}: {kind}"
-            for number, line in enumerate(text.splitlines(), 1)
-            for kind in scan_line(line)]
+def _findings_on(line: str, path: str, number: int | None, commit: str | None = None) -> list[Finding]:
+    marked = ALLOW_MARKER in line
+    out = []
+    for kind, value in scan_line(line):
+        exempt = None
+        if marked:
+            exempt = ("inline marker" if in_tests(path)
+                      else None)
+        finding = Finding(path, kind, value, number, commit, exempt)
+        if marked and exempt is None:
+            finding = Finding(path, f"{kind} (marker ignored: honoured only under tests/)", value,
+                              number, commit)
+        out.append(finding)
+    return out
 
 
-SKIPPED: list[str] = []   # files too large to scan, reported by main()
+_BOMS = ((codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),
+         (codecs.BOM_UTF8, "utf-8-sig"), (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16"))
 
 
-def scan_file(path: str) -> list[str]:
+def detect_encoding(head: bytes) -> str | None:
+    """The text encoding of a file from its first bytes, or None for a binary file."""
+    for bom, encoding in _BOMS:
+        if head.startswith(bom):
+            return encoding
+    if b"\0" not in head:
+        return "utf-8"
+    sample = head[:4096]
+    even, odd = sample[0::2], sample[1::2]
+    if sample and odd.count(0) > 0.3 * len(odd) and even.count(0) < 0.1 * len(even):
+        return "utf-16-le"
+    if sample and even.count(0) > 0.3 * len(even) and odd.count(0) < 0.1 * len(odd):
+        return "utf-16-be"
+    return None
+
+
+def iter_lines(path: str) -> Iterator[str] | None:
+    """The file's lines, decoded and streamed (any size), or None for a binary."""
+    with open(path, "rb") as handle:
+        head = handle.read(8192)
+    encoding = detect_encoding(head)
+    if encoding is None:
+        return None
+
+    def lines():
+        with open(path, encoding=encoding, errors="replace", newline="") as handle:
+            for line in handle:
+                yield line.rstrip("\r\n")
+
+    return lines()
+
+
+SKIPPED: list[str] = []   # binaries, reported by main()
+
+
+def scan_file(path: str) -> list[Finding]:
     findings = []
     reason = _forbidden(path)
     if reason:
-        findings.append(f"{path}: {reason}")
-    file = Path(path)
+        findings.append(Finding(path, reason, PurePosixPath(path.replace("\\", "/")).name))
     try:
-        if not file.is_file():
+        if not Path(path).is_file():
             return findings
-        if file.stat().st_size > MAX_BYTES:
-            SKIPPED.append(path)
-            return findings
-        data = file.read_bytes()
+        lines = iter_lines(path)
     except OSError:
         return findings
-    if b"\0" in data[:8192]:   # binary
+    if lines is None:
+        SKIPPED.append(path)
         return findings
-    return findings + scan_text(data.decode("utf-8", errors="replace"), path)
+    for number, line in enumerate(lines, 1):
+        findings += _findings_on(line, path, number)
+    return findings
 
 
 def tracked_files() -> list[str]:
@@ -161,7 +250,7 @@ def is_shallow() -> bool:
     return out.stdout.strip() == "true"
 
 
-def scan_history() -> list[str]:
+def scan_history() -> list[Finding]:
     """Every line added in any commit on any ref (merge resolutions included, via -m),
     and every file name ever committed."""
     log = subprocess.run(
@@ -169,7 +258,6 @@ def scan_history() -> list[str]:
         capture_output=True, check=True,
     ).stdout.decode("utf-8", errors="replace")
     findings, commit, path = [], "?", "?"
-    seen: set[str] = set()
     for line in log.splitlines():
         if line.startswith("commit "):
             commit = line.split()[1]
@@ -177,19 +265,34 @@ def scan_history() -> list[str]:
             path = line[6:] if line.startswith("+++ b/") else line[4:]
             reason = _forbidden(path) if path != "/dev/null" else None
             if reason:
-                findings.append(f"{commit} {path}: {reason}")
+                findings.append(Finding(path, reason, PurePosixPath(path).name, None, commit))
         elif line.startswith("+") and not line.startswith("+++"):
-            findings += [f"{commit} {path}: {kind}" for kind in scan_line(line[1:])]
+            findings += _findings_on(line[1:], path, None, commit)
     # -m repeats a merge's diff once per parent.
-    return [f for f in findings if not (f in seen or seen.add(f))]
+    seen: set = set()
+    return [f for f in findings if not (f.key in seen or seen.add(f.key))]
 
 
-def _allowlist() -> set[str]:
+_ALLOW_ENTRY = re.compile(
+    r"^(?:(?P<commit>[0-9a-f]{7,40}) )?(?P<path>.+?)(?::(?P<line>\d+))?: (?P<kind>.+) \[fp:(?P<fp>[0-9a-f]{16})\]$")
+
+
+def load_allowlist(path: str = ALLOWLIST_FILE) -> tuple[set[tuple], list[str]]:
+    """Reviewed findings as (commit, path, kind, fingerprint), and entries that bind no value."""
     try:
-        lines = Path(ALLOWLIST_FILE).read_text(encoding="utf-8").splitlines()
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
     except OSError:
-        return set()
-    return {line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")}
+        return set(), []
+    keys, invalid = set(), []
+    for line in (raw.strip() for raw in lines):
+        if not line or line.startswith("#"):
+            continue
+        match = _ALLOW_ENTRY.match(line)
+        if match:
+            keys.add((match["commit"] or "", match["path"], match["kind"], match["fp"]))
+        else:
+            invalid.append(line)
+    return keys, invalid
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -207,15 +310,27 @@ def main(argv: list[str] | None = None) -> int:
         findings = scan_history()
     else:
         findings = [f for path in (args.paths or tracked_files()) for f in scan_file(path)]
-    findings = [f for f in findings if f not in _allowlist()]
+
+    reviewed, invalid = load_allowlist()
+    for entry in invalid:
+        print(f"warning: {ALLOWLIST_FILE}: ignored an entry with no [fp:...] fingerprint: {entry}",
+              file=sys.stderr)
+    failing = []
     for finding in findings:
+        if finding.exempt:
+            print(f"exempt ({finding.exempt}): {finding}")
+        elif finding.key in reviewed:
+            print(f"exempt (reviewed in {ALLOWLIST_FILE}): {finding}")
+        else:
+            failing.append(finding)
+    for finding in failing:
         print(finding)
     for path in SKIPPED:
-        print(f"warning: {path}: skipped, larger than {MAX_BYTES:,} bytes; check it by other means",
-              file=sys.stderr)
-    if findings:
-        print(f"\n{len(findings)} possible secret(s) found. Remove them (and rotate any real key), "
-              f"or mark a deliberate example with '{ALLOW_MARKER}'.", file=sys.stderr)
+        print(f"note: {path}: binary file, not scanned", file=sys.stderr)
+    if failing:
+        print(f"\n{len(failing)} possible secret(s) found. Remove them (and rotate any real key); a test "
+              f"fixture under tests/ may carry '{ALLOW_MARKER}', and a reviewed false positive can be "
+              f"listed in {ALLOWLIST_FILE} with its fingerprint.", file=sys.stderr)
         return 1
     return 0
 

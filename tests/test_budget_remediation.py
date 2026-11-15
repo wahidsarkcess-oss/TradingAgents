@@ -9,20 +9,16 @@ from __future__ import annotations
 
 import copy
 import json
-import logging
 import multiprocessing
 import os
 import shutil
 import subprocess
 import sys
-import threading
-import time
 import uuid
 from pathlib import Path
 
 import pytest
 from langchain_core.messages import HumanMessage
-from pydantic import Field
 
 from tests.test_graph_end_to_end import TRADE_DATE, _Client, offline  # noqa: F401
 from tests.test_run_budget import (  # noqa: F401
@@ -50,6 +46,7 @@ from tradingagents.llm_clients.budget import (
     bind_owner,
     endpoint_supported,
     load_pricing,
+    note_retry,
     reset_owner,
     settlement_scope,
 )
@@ -262,8 +259,9 @@ def test_a_new_run_keeps_in_flight_reservations_and_charges_late_completions_to_
     finally:
         reset_owner(token)
 
+    budget.end_run(first)                           # the run failed while this call was in flight
     second = budget.begin_run()                     # the next backtest cell starts
-    assert first.ended and run_id in budget._inflight
+    assert first.ended and not second.ended and run_id in budget._inflight
 
     cb.on_llm_end(_result(usage=(100, 50)), run_id=run_id)   # the old call completes late
     assert first.scopes["analysis"].reported_input == 100
@@ -279,36 +277,7 @@ def test_a_new_run_keeps_in_flight_reservations_and_charges_late_completions_to_
     assert refused.value.scope == "run_ended"
 
 
-class OrphanModel(MeteredModel):
-    """The first call fails at once; every other call takes a while, so the other
-    analysts are still mid-call when the run raises."""
-
-    first: list = Field(default_factory=list)
-    lock: object = Field(default_factory=threading.Lock)
-
-    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-        with self.lock:
-            failing = not self.first
-            self.first.append(1)
-        if failing:
-            raise RuntimeError("provider unavailable")
-        time.sleep(0.4)
-        return super()._generate(messages, stop, run_manager, **kwargs)
-
-
-@pytest.mark.unit
-def test_analysts_left_running_after_a_failure_cannot_escape_accounting(tmp_path, monkeypatch, offline):  # noqa: F811
-    model = OrphanModel()
-    graph = _graph(tmp_path, monkeypatch, model, max_llm_calls_per_run=100)
-    with pytest.raises(RuntimeError, match="provider unavailable"):
-        graph.propagate("NVDA", TRADE_DATE)
-    ended = graph.budget.current
-    graph.budget.begin_run()                        # the next cell, while orphans still run
-    time.sleep(1.5)                                 # their calls finish; their next ones are refused
-
-    assert graph.budget.current.total.attempted == 0          # nothing charged to the new run
-    session = graph.budget.summary(session=True)["calls"]["attempted"]
-    assert session == ended.total.attempted == len(model.calls) + 1   # +1: the failed call
+# The orphaned-analyst scenario is tested deterministically in test_budget_second_pass.py.
 
 
 @pytest.mark.unit
@@ -539,12 +508,12 @@ def test_sensitive_file_names_are_refused(tmp_path, name):
 
 
 @pytest.mark.unit
-def test_oversized_files_are_reported_as_skipped(tmp_path, capsys):
-    scan = _scanner()
+def test_a_key_deep_inside_a_large_file_is_found(tmp_path, capsys):
+    """Review M6: files over 2 MB used to be skipped with only a warning."""
     big = tmp_path / "dump.txt"
-    big.write_text("x" * (scan.MAX_BYTES + 1))
-    assert scan.main([str(big)]) == 0
-    assert "dump.txt: skipped, larger than" in capsys.readouterr().err
+    big.write_text(("x" * 99 + "\n") * 40_000 + "KEY = '" + "AK" + "IA" + "B" * 16 + "'\n")   # ~4 MB
+    assert _scanner().main([str(big)]) == 1
+    assert "AWS access key id" in capsys.readouterr().out
 
 
 def _git(cwd, *args):
@@ -615,9 +584,8 @@ def test_an_sdk_retry_past_the_call_limit_is_refused_before_it_is_sent():
     cb = budget.callback("openai", "quick-model")
     run_id = uuid.uuid4()
     cb.on_chat_model_start({}, [[HumanMessage(content="hello")]], run_id=run_id)
-    with pytest.raises(LLMBudgetExceeded, match="SDK retry refused"):
-        logging.getLogger("openai._base_client").info("Retrying request in %f seconds (retry %i of %s)",
-                                                      0.5, 1, 2)
+    with pytest.raises(LLMBudgetExceeded, match="retry refused"):
+        note_retry()                                # the hooked SDK, about to retry
     assert budget.summary()["calls"]["sdk_retries"] == 0
 
 
@@ -636,15 +604,15 @@ def test_a_real_openai_client_stops_retrying_at_the_limit():
 
 
 @pytest.mark.unit
-def test_retries_are_counted_without_limits_and_add_no_log_output(caplog):
+def test_retries_are_counted_and_never_refused_without_limits():
     budget = RunBudget()
     cb = budget.callback("openai", "quick-model")
     run_id = uuid.uuid4()
     cb.on_chat_model_start({}, [[HumanMessage(content="hello")]], run_id=run_id)
-    logging.getLogger("openai._base_client").info("Retrying request in %f seconds (retry %i of %s)", 0.5, 1, 2)
+    for _ in range(5):
+        note_retry()
     cb.on_llm_end(_result(), run_id=run_id)
-    assert budget.summary()["calls"]["sdk_retries"] == 1
-    assert "Retrying request" not in caplog.text    # INFO the host never asked for stays hidden
+    assert budget.summary()["calls"]["sdk_retries"] == 5
 
 
 # --- L2: TypeSafe screening ------------------------------------------------------------
@@ -673,17 +641,22 @@ def test_typesafe_screening_is_not_made_under_a_cost_limit(tmp_path, jev, monkey
 
 @pytest.mark.unit
 def test_typesafe_requests_are_counted_in_the_run(jev, monkeypatch):
-    answer = {"about": {"noul": 1.0}, "stance": {"choice": "bullish"}}
-    monkeypatch.setattr(jev, "_ask_each", lambda instrument, posts: [answer] * len(posts))
+    sent = []
+    monkeypatch.setattr(jev.requests, "post", lambda *a, **k: sent.append(1) or _typesafe_ok())
+    monkeypatch.setattr(jev, "_answers", lambda response, questions: {
+        "about": {"noul": 1.0}, "stance": {"choice": "bullish"}})
     monkeypatch.setattr(jev, "_stance", lambda a: "bullish")
     budget = RunBudget(max_calls=40)
-    token = bind_owner(budget.current)
-    try:
+    account = budget.begin_run()
+    with budget.bound(account):
         jev.jev_screen("NVDA")(["a", "b", "c"])
-    finally:
-        reset_owner(token)
-    assert budget.summary()["external_paid_requests"] == 3
-    assert budget.summary()["calls"]["attempted"] == 0      # not LLM calls, counted apart
+    assert len(sent) == 3
+    assert account.total.external_requests == 3     # every request sent, counted in its own run
+    assert account.total.attempted == 0             # not LLM calls, counted apart
+
+
+def _typesafe_ok():
+    return type("Response", (), {"status_code": 200, "headers": {}})()
 
 
 # --- L5: exceptions whose message cannot be scrubbed in place ----------------------------

@@ -10,7 +10,6 @@ from __future__ import annotations
 import contextlib
 import copy
 import json
-import logging
 import math
 import threading
 import uuid
@@ -34,6 +33,7 @@ from tradingagents.llm_clients.budget import (
     _message_bytes,
     describe_usage,
     load_pricing,
+    note_retry,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -106,16 +106,17 @@ def test_failed_requests_count_towards_the_call_limit():
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("sdk_logger, message, args", [
-    ("openai._base_client", "Retrying request in %f seconds (retry %i of %s)", (0.5, 1, 2)),
-    ("anthropic._base_client", "Retrying request to %s in %f seconds", ("/v1/messages", 0.5)),
-])
-def test_sdk_retries_are_counted_and_spend_the_call_limit(sdk_logger, message, args):
-    budget = RunBudget(max_calls=2)
+@pytest.mark.parametrize("sdk", ["openai", "anthropic"])
+def test_sdk_retries_are_counted_and_spend_the_call_limit(sdk):
+    import importlib
+
+    budget = RunBudget(max_calls=2)                      # limits on: the SDK retry hooks go in
+    base = importlib.import_module(f"{sdk}._base_client")
+    assert getattr(base.SyncAPIClient._sleep_for_retry, "_tradingagents_hook", False)
     cb = budget.callback("openai", "quick-model")
     run_id = uuid.uuid4()
     cb.on_chat_model_start({}, [[HumanMessage(content="hello world")]], run_id=run_id)
-    logging.getLogger(sdk_logger).info(message, *args)   # the SDK retrying inside the call
+    note_retry()                                         # what the hooked SDK does before a retry
     cb.on_llm_end(_result(usage=(10, 5)), run_id=run_id)
 
     assert budget.summary()["calls"]["sdk_retries"] == 1
@@ -182,13 +183,15 @@ def test_a_response_without_usage_is_counted_at_an_estimate_labelled_as_such():
 
 
 @pytest.mark.unit
-def test_begin_run_resets_the_run_but_the_session_keeps_counting():
+def test_each_run_has_its_own_allowance_but_the_session_keeps_counting():
     budget = RunBudget(max_calls=1)
     cb = budget.callback("openai", "quick-model")
-    _call(cb)
-    budget.begin_run()
-    _call(cb)                                           # a new analysis gets its own allowance
-    assert budget.summary()["calls"]["attempted"] == 1
+    for _ in range(2):
+        account = budget.begin_run()
+        with budget.bound(account):
+            _call(cb)                                   # each analysis gets its own allowance
+        assert account.total.attempted == 1
+        budget.end_run(account, completed=True)
     assert budget.summary(session=True)["calls"]["attempted"] == 2
 
 
@@ -387,6 +390,11 @@ class MeteredModel(ScriptedModel):
     so the budget sees them; optionally reports token usage like a provider."""
 
     usage: tuple | None = None
+
+    @property
+    def root_client(self):
+        """Where this stand-in "sends" requests, as ChatOpenAI's SDK client reports it."""
+        return type("Client", (), {"base_url": "https://api.openai.com/v1/"})()
 
     def with_structured_output(self, schema, **kwargs):
         if not self.structured:

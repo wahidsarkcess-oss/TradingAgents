@@ -7,66 +7,75 @@ happens *before* a request is sent (``on_chat_model_start``, and before each SDK
 retry), and a refused call raises ``LLMBudgetExceeded`` out of the model's
 ``invoke``.
 
-**Runs and allowances.** Each analysis is a ``RunAccount`` (``begin_run``). A call
-belongs to the account bound to the context it runs in (LangGraph carries the
-context into its worker threads), so a call from an analysis that has already
-ended is refused rather than charged to the next one, and a call still in flight
-when its analysis ends is charged to that analysis when it completes. An account
-has two allowances:
+**With every limit off** the budget only counts. It refuses nothing, installs no
+SDK hooks and changes no client setting, so the application behaves as it did
+before budgets existed.
 
-- ``analysis``: the agents' calls, capped by ``max_llm_calls_per_run``,
-  ``max_tokens_per_run`` and ``max_cost_per_run_usd``;
-- ``settlement``: reflections on past decisions (``settlement_scope()``), capped
-  by ``max_reflection_calls_per_run`` / ``max_reflection_tokens_per_run``, which
-  default to the analysis values, and ``max_cost_per_run_usd``, each as a separate
-  pool. Both count towards session and daily totals.
+**Runs.** Each analysis, and each settlement pass outside an analysis, is its own
+``RunAccount``. A call belongs to the account bound to the context it runs in
+(LangGraph carries the context into its worker threads); a call outside any run
+goes to a standing default account. Starting an account never ends another: a
+run ends only its own account (``end_run``), so concurrent analyses and
+settlement passes on one graph never invalidate each other. With limits on, a
+call from an account that has already ended (an analyst still running after its
+run failed) is refused; a call that was in flight when its run ended is charged
+to that run when it completes.
 
-A checkpointed analysis persists its account to a file beside the checkpoint, so
-a resume continues from the usage already spent instead of a fresh allowance.
+**Allowances.** An account's calls and tokens are capped per allowance:
+``analysis`` (``max_llm_calls_per_run``, ``max_tokens_per_run``) and
+``settlement``, i.e. reflections on past decisions (``max_reflection_calls_per_run``
+/ ``max_reflection_tokens_per_run``, defaulting to the analysis values as a
+separate pool). Cost has one ceiling per run: ``max_cost_per_run_usd`` caps the
+analysis and its reflections together. Session and daily limits cover everything.
+
+**Persistence.** A checkpointed analysis keeps its usage in a record beside the
+checkpoint, including every reservation in flight, written before the request
+is sent. A resume continues from that usage, and a reservation still open when
+the process died is counted as spent at its worst case.
 
 **What is counted.**
 
-- Calls: every attempt the model client starts, failed ones included, plus the
-  retries the OpenAI and Anthropic SDKs make internally. A retry is seen through
-  the SDK's "Retrying request" log record, before it is sent, and is refused
-  like a call when it would pass a limit.
+- Calls: every attempt the model client starts, failed ones included, plus
+  provider retries. With limits on, retries go through budget-controlled code:
+  the OpenAI and Anthropic SDKs' retries are intercepted before each is sent;
+  Google's and Bedrock's own retries are switched off and done by the
+  TradingAgents client wrappers, which ask the budget first.
 - Tokens: the input and output tokens the provider reports. A response without
   usage, a failed request and a retry are counted at an estimate (prompt UTF-8
   bytes / 2, plus the reply) and reported apart as ``estimated_unreported``.
-- Cost: ``estimated`` is the counted tokens priced from your pricing file;
-  ``provider_reported`` is a cost the provider returned itself (OpenRouter does).
-  Each call is charged the larger of the two; failures and retries are charged
-  their input estimate. An upper-bound estimate, not a bill.
-- External paid requests (TypeSafe screening): counted, and not made at all
-  while a cost limit is set, since the pricing file cannot price them.
+- Cost: ``estimated`` is the counted tokens priced from your pricing file, with
+  cache-write and long-context rates where they apply; ``provider_reported`` is
+  a cost the provider returned itself (OpenRouter does). Each call is charged the
+  larger of the two; failures and retries are charged their input estimate.
+- External paid requests (TypeSafe screening): every attempt is counted, capped
+  by ``max_external_requests_per_run``, and none is made under a cost limit.
 
 **Cost limits fail closed.** With ``max_cost_per_run_usd``/``max_cost_per_day_usd``
-set, the graph refuses to start unless: every model is priced by a valid pricing
+set, the graph refuses to start unless every model is priced by a valid pricing
 file no older than ``max_pricing_age_days``; ``max_tokens`` bounds each reply;
-every tier uses a provider whose client honours ``max_tokens`` and reports token
-usage (``COST_LIMIT_PROVIDERS``) at its official endpoint. A response without
-usage, an unreadable ledger or a failed ledger write stops every later call.
+and every tier is a provider in ``COST_LIMIT_PROVIDERS`` whose *constructed
+client* targets that provider's official endpoint (environment overrides such as
+``OPENAI_BASE_URL`` included). A response without usage, an unreadable ledger or
+a failed ledger write stops every later call.
 
 **Daily ledger.** ``<data_cache_dir>/spend/<UTC date>.json``. Whenever prices are
 known, each call reserves its worst-case cost in the ledger under a lock shared
 by every process using the same cache directory, and settles it on completion;
-the daily limit counts settled spend plus every open reservation, so concurrent
-processes cannot jointly pass it. A process that dies mid-call leaves its
-reservation counted for the rest of the day. The ledger is per cache directory:
-hosts or containers without shared storage each keep their own, and file locks
-are not reliable on network filesystems.
+retries are checked and charged the same way. The daily limit counts settled
+spend plus every open reservation. A process that dies mid-call leaves its
+reservation counted for the rest of the day. The ledger is per cache directory;
+file locks are not reliable on network filesystems.
 
-**Estimates.** Before each call the budget reserves its worst case: estimated
-prompt tokens plus the output limit. Limits hold exactly while real usage stays
-within the reservation, which ``max_tokens`` guarantees for the output; the prompt
-estimate (2 bytes per token) overstates English about fourfold and CJK about
-1.5-fold, but unusual text could still tokenize tighter, in which case the calls
-in flight can overshoot by the difference and every later call is refused.
+**Estimates.** A reservation is the estimated prompt tokens plus the output limit,
+priced at the highest input rate that can apply: the long-context rate when the
+prompt could exceed its threshold (a token is never shorter than one UTF-8 byte),
+and for providers with prompt-cache writes the cache-write rate.
 """
 
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 import math
@@ -95,30 +104,32 @@ LIMIT_KEYS = (
     "max_cost_per_day_usd",
     "max_reflection_calls_per_run",
     "max_reflection_tokens_per_run",
+    "max_external_requests_per_run",
 )
 BUDGET_CONFIG_KEYS = (*LIMIT_KEYS, "pricing_file", "max_pricing_age_days")
 
 ANALYSIS, SETTLEMENT = "analysis", "settlement"
+RECORD_VERSION = 2
 
 # Output reserved for a call when no per-call ``max_tokens`` limit is set.
 DEFAULT_OUTPUT_RESERVATION = 8192
 # UTF-8 bytes per token for estimates: English averages about 4 characters per
 # token and a CJK character is 3 bytes for 1-2 tokens, so 2 errs towards refusing.
 BYTES_PER_TOKEN = 2
-
-# Loggers whose "Retrying request" records mark an SDK-internal retry.
-RETRY_LOGGERS = ("openai._base_client", "anthropic._base_client")
+# Retries the TradingAgents wrappers make for Google and Bedrock under a budget
+# when llm_max_retries is not set.
+DEFAULT_BUDGET_RETRIES = 2
 
 # Providers whose LangChain client honours ``max_tokens`` and returns token usage
 # on every (non-streamed) response, at the hosts they officially serve from. Cost
 # limits are refused for anything else: a ChatGPT plan drops max_tokens and
-# streams, and a local or custom endpoint's usage reporting is unknown.
+# streams, a local or custom endpoint's usage reporting is unknown, and Bedrock's
+# client could not be verified (langchain-aws is an optional extra).
 OFFICIAL_HOSTS: dict[str, tuple[str, ...]] = {
     "openai": ("api.openai.com",),
     "anthropic": ("api.anthropic.com",),
     "google": ("generativelanguage.googleapis.com",),
     "azure": (".openai.azure.com", ".cognitiveservices.azure.com"),
-    "bedrock": (),   # no backend_url: the AWS SDK picks the regional endpoint
     "xai": ("api.x.ai",),
     "deepseek": ("api.deepseek.com",),
     "qwen": ("dashscope-intl.aliyuncs.com",),
@@ -134,16 +145,20 @@ OFFICIAL_HOSTS: dict[str, tuple[str, ...]] = {
     "nvidia": ("integrate.api.nvidia.com",),
 }
 COST_LIMIT_PROVIDERS = frozenset(OFFICIAL_HOSTS)
+# Providers that can charge for writing the prompt cache.
+CACHE_WRITE_PROVIDERS = frozenset({"anthropic", "bedrock"})
+# Which SDK retries each provider's client.
+SDK_OF_PROVIDER = {"anthropic": "anthropic", "google": "google", "bedrock": "bedrock"}
 
 
 class LLMBudgetExceeded(RuntimeError):
-    """A limit refused an LLM call (or an SDK retry) before it was sent.
+    """A limit refused an LLM call (or a retry, or an external request) before it was sent.
 
     ``scope`` names the limit: ``calls``, ``tokens``, ``run_cost``,
-    ``reflection_calls``, ``reflection_tokens``, ``reflection_cost``,
-    ``day_cost``, ``session_cost``, ``pricing``, ``usage_unreported``, ``ledger``,
-    ``usage_record``, ``run_ended`` or ``resume``. ``usage`` is the run's usage
-    summary when it was refused. The message never contains credentials.
+    ``reflection_calls``, ``reflection_tokens``, ``day_cost``, ``session_cost``,
+    ``pricing``, ``usage_unreported``, ``ledger``, ``usage_record``, ``run_ended``,
+    ``resume``, ``resume_in_progress`` or ``external_requests``. ``usage`` is the
+    run's usage summary when it was refused. The message never contains credentials.
     """
 
     def __init__(self, scope: str, message: str, usage: dict | None = None):
@@ -153,36 +168,82 @@ class LLMBudgetExceeded(RuntimeError):
 
 
 class PricingError(ValueError):
-    """Cost limits cannot be trusted: pricing, output limit or provider is unsuitable."""
+    """Cost limits cannot be trusted: pricing, output limit, provider or endpoint is unsuitable."""
 
 
 # --- pricing -----------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class ModelPrice:
-    """USD per million tokens.
+class Rates:
+    """USD per million tokens for one pricing tier."""
 
-    Cached input falls back to the full input rate. Cache writes (Anthropic) fall
-    back to twice the input rate, the highest write multiplier providers charge.
-    """
+    input: float
+    output: float
+    cached_input: float | None = None
+    cache_write: float | None = None
+
+    @property
+    def cached_rate(self) -> float:
+        return self.input if self.cached_input is None else self.cached_input
+
+    @property
+    def write_rate(self) -> float:
+        # Unpriced cache writes are charged at twice the input rate, the highest
+        # write multiplier providers charge.
+        return 2 * self.input if self.cache_write is None else self.cache_write
+
+
+@dataclass(frozen=True)
+class ModelPrice:
+    """A model's prices: a base tier, and optionally a long-context tier that
+    applies to a whole request whose input exceeds ``long_context_above`` tokens."""
 
     input_per_mtok: float
     output_per_mtok: float
     cached_input_per_mtok: float | None = None
     cache_write_per_mtok: float | None = None
+    long_context_above: int | None = None
+    long_context: Rates | None = None
+
+    @property
+    def base(self) -> Rates:
+        return Rates(self.input_per_mtok, self.output_per_mtok, self.cached_input_per_mtok,
+                     self.cache_write_per_mtok)
+
+    def tier(self, input_tokens: int) -> Rates:
+        if self.long_context is not None and input_tokens > (self.long_context_above or 0):
+            return self.long_context
+        return self.base
 
     def cost(self, input_tokens: int, output_tokens: int, cached_tokens: int = 0,
              cache_write_tokens: int = 0) -> float:
+        """What a completed request cost, from the tokens the provider reported."""
+        rates = self.tier(input_tokens)
         total_in = max(input_tokens, 0)
         cached = min(max(cached_tokens, 0), total_in)
         written = min(max(cache_write_tokens, 0), total_in - cached)
-        cached_rate = self.input_per_mtok if self.cached_input_per_mtok is None else self.cached_input_per_mtok
-        write_rate = 2 * self.input_per_mtok if self.cache_write_per_mtok is None else self.cache_write_per_mtok
-        return ((total_in - cached - written) * self.input_per_mtok
-                + cached * cached_rate
-                + written * write_rate
-                + max(output_tokens, 0) * self.output_per_mtok) / 1_000_000
+        return ((total_in - cached - written) * rates.input
+                + cached * rates.cached_rate
+                + written * rates.write_rate
+                + max(output_tokens, 0) * rates.output) / 1_000_000
+
+    def worst_case_rates(self, prompt_bytes: int, provider: str) -> tuple[float, float]:
+        """(input, output) rates to reserve at: the highest that can apply to a prompt
+        of ``prompt_bytes`` bytes. A token covers at least one byte, so the prompt
+        cannot exceed ``prompt_bytes`` tokens."""
+        rates = self.base
+        if self.long_context is not None and prompt_bytes > (self.long_context_above or 0):
+            rates = Rates(max(rates.input, self.long_context.input), max(rates.output, self.long_context.output),
+                          rates.cached_input, max(rates.write_rate, self.long_context.write_rate))
+        input_rate = rates.input
+        if provider in CACHE_WRITE_PROVIDERS:
+            input_rate = max(input_rate, rates.write_rate)
+        return input_rate, rates.output
+
+    def reservation(self, prompt_bytes: int, input_tokens: int, output_tokens: int, provider: str) -> float:
+        input_rate, output_rate = self.worst_case_rates(prompt_bytes, provider)
+        return (max(input_tokens, 0) * input_rate + max(output_tokens, 0) * output_rate) / 1_000_000
 
 
 @dataclass(frozen=True)
@@ -206,15 +267,43 @@ def _price_field(entry: dict, name: str, key: str, required: bool) -> float | No
     return float(value)
 
 
+def _model_price(key: str, entry: Any) -> ModelPrice:
+    if not isinstance(entry, dict):
+        raise PricingError(f"pricing for {key!r} must be an object")
+    long_context, above = None, None
+    tier = entry.get("long_context")
+    if tier is not None:
+        if not isinstance(tier, dict):
+            raise PricingError(f"pricing for {key!r}: long_context must be an object")
+        above = tier.get("above_input_tokens")
+        if isinstance(above, bool) or not isinstance(above, int) or above < 0:
+            raise PricingError(f"pricing for {key!r}: long_context.above_input_tokens must be a "
+                               "non-negative whole number")
+        long_context = Rates(
+            _price_field(tier, "input_per_mtok", key, True), _price_field(tier, "output_per_mtok", key, True),
+            _price_field(tier, "cached_input_per_mtok", key, False),
+            _price_field(tier, "cache_write_per_mtok", key, False),
+        )
+    return ModelPrice(
+        input_per_mtok=_price_field(entry, "input_per_mtok", key, True),
+        output_per_mtok=_price_field(entry, "output_per_mtok", key, True),
+        cached_input_per_mtok=_price_field(entry, "cached_input_per_mtok", key, False),
+        cache_write_per_mtok=_price_field(entry, "cache_write_per_mtok", key, False),
+        long_context_above=above, long_context=long_context,
+    )
+
+
 def load_pricing(path: str | Path, max_age_days: int | None, today: date | None = None) -> Pricing:
     """Read and validate a pricing file; raise ``PricingError`` on anything doubtful.
 
     Expected shape::
 
         {"currency": "USD", "as_of": "2026-11-01", "source": "https://...",
-         "models": {"openai:gpt-6-luna": {"input_per_mtok": 0.0, "output_per_mtok": 0.0,
-                                          "cached_input_per_mtok": 0.0,
-                                          "cache_write_per_mtok": 0.0}}}
+         "models": {"anthropic:claude-x": {
+             "input_per_mtok": 3.0, "output_per_mtok": 15.0,
+             "cached_input_per_mtok": 0.3, "cache_write_per_mtok": 3.75,
+             "long_context": {"above_input_tokens": 200000,
+                              "input_per_mtok": 6.0, "output_per_mtok": 22.5}}}}
 
     ``as_of`` is the day the prices were copied from the provider; a file older
     than ``max_age_days`` (or dated in the future) is treated as unreliable.
@@ -246,16 +335,7 @@ def load_pricing(path: str | Path, max_age_days: int | None, today: date | None 
     models = data.get("models")
     if not isinstance(models, dict) or not models:
         raise PricingError(f"pricing file {path}: models must map model ids to prices")
-    prices = {}
-    for key, entry in models.items():
-        if not isinstance(entry, dict):
-            raise PricingError(f"pricing for {key!r} must be an object")
-        prices[str(key)] = ModelPrice(
-            input_per_mtok=_price_field(entry, "input_per_mtok", key, True),
-            output_per_mtok=_price_field(entry, "output_per_mtok", key, True),
-            cached_input_per_mtok=_price_field(entry, "cached_input_per_mtok", key, False),
-            cache_write_per_mtok=_price_field(entry, "cache_write_per_mtok", key, False),
-        )
+    prices = {str(key): _model_price(str(key), entry) for key, entry in models.items()}
     return Pricing(prices=prices, as_of=str(as_of), source=str(data.get("source") or ""), path=str(path))
 
 
@@ -285,9 +365,32 @@ def endpoint_supported(provider: str, base_url: str | None) -> bool:
         return False
     if not base_url:
         return True
-    host = (urlparse(base_url).hostname or "").lower()
+    host = (urlparse(str(base_url)).hostname or "").lower()
     allowed = OFFICIAL_HOSTS[provider]
     return bool(host) and any(host == a or (a.startswith(".") and host.endswith(a)) for a in allowed)
+
+
+def client_endpoint(llm: Any) -> str | None:
+    """The endpoint a constructed LangChain chat model will actually call.
+
+    Read from the SDK client the model built, so environment overrides
+    (``OPENAI_BASE_URL``, ``ANTHROPIC_BASE_URL``, ...) and gateways are seen.
+    None when it cannot be determined.
+    """
+    candidates = []
+    for path in (("root_client", "base_url"),               # ChatOpenAI and subclasses, Azure
+                 ("_client", "base_url"),                   # ChatAnthropic
+                 ("client", "_api_client", "_http_options", "base_url"),   # ChatGoogleGenerativeAI
+                 ("client", "meta", "endpoint_url")):       # ChatBedrockConverse
+        node = llm
+        try:
+            for attr in path:
+                node = getattr(node, attr)
+        except Exception:  # noqa: BLE001 — an attribute that cannot be read is no answer
+            continue
+        if node:
+            candidates.append(str(node))
+    return candidates[0] if candidates else None
 
 
 # --- counting ----------------------------------------------------------------------
@@ -311,6 +414,7 @@ class _Totals:
     provider_reported_cost_calls: int = 0
     charged_cost: float = 0.0
     external_requests: int = 0
+    unresolved_recovered: int = 0
 
     @property
     def tokens(self) -> int:
@@ -321,52 +425,80 @@ class _Totals:
 
     @classmethod
     def from_dict(cls, data: Any) -> _Totals:
+        """Strict: every field present, of its type, finite and non-negative."""
         if not isinstance(data, dict):
             raise ValueError("not an object")
         values = {}
         for f in fields(cls):
-            value = data.get(f.name, 0)
-            kind = float if f.type in ("float", float) else int
+            if f.name not in data:
+                raise ValueError(f"missing {f.name}")
+            value = data[f.name]
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"bad {f.name}")
-            values[f.name] = kind(value)
+            values[f.name] = float(value) if f.type in ("float", float) else int(value)
         return cls(**values)
 
 
 class RunAccount:
-    """The usage of one analysis, in its two allowances."""
+    """The usage of one analysis (or one settlement pass), in its two allowances."""
 
-    def __init__(self, budget: RunBudget, persist_path: Path | None = None):
+    def __init__(self, budget: RunBudget, persist_path: Path | None = None, kind: str = ANALYSIS):
         self.id = uuid.uuid4().hex[:12]
         self.budget = budget
+        self.kind = kind
         self.scopes = {ANALYSIS: _Totals(), SETTLEMENT: _Totals()}
         self.ended = False
         self.persist_path = persist_path
+        # Reservations in flight, persisted before each request is sent.
+        self.inflight: dict[str, dict] = {}
         self.broken: str | None = None   # why the usage record can no longer be trusted
 
     @property
     def total(self) -> _Totals:
         return self.scopes[ANALYSIS].add(self.scopes[SETTLEMENT])
 
-    def save(self) -> None:
-        """Write the usage beside the checkpoint; a failure is recorded, then refused on."""
+    def save(self) -> bool:
+        """Write the usage beside the checkpoint; False (and recorded) on failure."""
         if self.persist_path is None:
-            return
+            return True
         try:
             _write_json_atomic(self.persist_path, {
-                "version": 1, "account": self.id,
+                "version": RECORD_VERSION, "account": self.id,
                 "scopes": {name: asdict(t) for name, t in self.scopes.items()},
+                "inflight": self.inflight,
             })
+            return True
         except OSError as exc:
             self.broken = f"the usage record for this checkpoint could not be saved ({type(exc).__name__})"
             logger.error("LLM budget: %s", self.broken)
+            return False
 
     def load(self) -> None:
+        """Restore a saved record; anything incomplete or malformed raises ValueError."""
         data = json.loads(Path(self.persist_path).read_text(encoding="utf-8"))
-        scopes = data.get("scopes") if isinstance(data, dict) else None
-        if not isinstance(scopes, dict):
-            raise ValueError("no scopes")
-        self.scopes = {name: _Totals.from_dict(scopes.get(name, {})) for name in (ANALYSIS, SETTLEMENT)}
+        if not isinstance(data, dict) or data.get("version") != RECORD_VERSION:
+            raise ValueError("unknown record version")
+        scopes = data.get("scopes")
+        if not isinstance(scopes, dict) or set(scopes) != {ANALYSIS, SETTLEMENT}:
+            raise ValueError("scopes incomplete")
+        restored = {name: _Totals.from_dict(scopes[name]) for name in (ANALYSIS, SETTLEMENT)}
+        inflight = data.get("inflight")
+        if not isinstance(inflight, dict):
+            raise ValueError("inflight missing")
+        for entry in inflight.values():
+            if (not isinstance(entry, dict) or entry.get("scope") not in (ANALYSIS, SETTLEMENT)
+                    or not all(isinstance(entry.get(k), (int, float)) and not isinstance(entry.get(k), bool)
+                               and math.isfinite(entry[k]) and entry[k] >= 0 for k in ("tokens", "cost"))):
+                raise ValueError("inflight entry malformed")
+        self.scopes = restored
+        # A reservation still open when the process died: count it as spent, at its
+        # worst case, since the request may have been sent and billed.
+        for entry in inflight.values():
+            totals = self.scopes[entry["scope"]]
+            totals.estimated_unreported += int(entry["tokens"])
+            totals.charged_cost += float(entry["cost"])
+            totals.unresolved_recovered += 1
+        self.inflight = {}
 
 
 @dataclass
@@ -376,10 +508,12 @@ class _Reservation:
     provider: str
     model: str
     price: ModelPrice | None
+    prompt_bytes: int
     input_estimate: int
     tokens: int
     cost: float
     ledger: tuple[Path, str] | None
+    key: str
 
 
 # The run that owns a call, and the allowance it draws on, carried by context.
@@ -412,53 +546,79 @@ def reset_owner(token) -> None:
     _owner.reset(token)
 
 
-def meter_external_requests(service: str, requests: int) -> None:
+def meter_external_requests(service: str, requests: int = 1) -> None:
     """Count paid requests made outside the LLM clients (TypeSafe screening).
 
-    Raises ``LLMBudgetExceeded`` when a cost limit is set: the pricing file cannot
-    price them, so they are not made. Outside a run this does nothing.
+    Raises ``LLMBudgetExceeded`` when a cost limit is set (the pricing file cannot
+    price them) or when ``max_external_requests_per_run`` would be passed. Outside
+    a run this does nothing.
     """
     account = _owner.get()
     if account is not None:
         account.budget._external(account, service, requests)
 
 
-class _RetryFilter(logging.Filter):
-    """Sees each SDK retry before it is sent: counts it, or refuses it by raising.
+def note_retry() -> None:
+    """A provider client is about to retry the call this thread is making.
 
-    The SDK logger's level is lowered to INFO so retry records are created at all;
-    records below the level the logger had before are dropped here, so no host
-    application sees log output it did not ask for.
+    Counts the retry against the call's run, or raises ``LLMBudgetExceeded`` when
+    it would pass a limit, in which case the retry is not sent. Outside a
+    budgeted call this does nothing.
     """
-
-    def __init__(self, original_level: int):
-        super().__init__()
-        self.original_level = original_level
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if record.levelno == logging.INFO and str(record.msg).startswith("Retrying request"):
-            current = getattr(_active, "call", None)
-            if current is not None:
-                budget, run_id = current
-                budget._retry(run_id)   # LLMBudgetExceeded propagates and aborts the retry
-        return record.levelno >= self.original_level
+    current = getattr(_active, "call", None)
+    if current is not None:
+        budget, run_id = current
+        budget._retry(run_id)
 
 
-_retry_filter_lock = threading.Lock()
-_retry_filters: dict[str, _RetryFilter] = {}
+# --- SDK retry hooks (installed only when a budget has limits) ---------------------
+
+_hooks_lock = threading.Lock()
+_hooks: dict[str, bool] = {}
 
 
-def _install_retry_filter() -> None:
-    with _retry_filter_lock:
-        for name in RETRY_LOGGERS:
-            if name in _retry_filters:
-                continue
-            sdk_logger = logging.getLogger(name)
-            retry_filter = _RetryFilter(sdk_logger.getEffectiveLevel())
-            if sdk_logger.getEffectiveLevel() > logging.INFO:
-                sdk_logger.setLevel(logging.INFO)
-            sdk_logger.addFilter(retry_filter)
-            _retry_filters[name] = retry_filter
+def _hook_sdk(name: str) -> bool:
+    """Route an SDK's retries through ``note_retry``, before each is sent."""
+    try:
+        module = __import__(f"{name}._base_client", fromlist=["SyncAPIClient", "AsyncAPIClient"])
+        sync_cls, async_cls = module.SyncAPIClient, module.AsyncAPIClient
+        sync_original, async_original = sync_cls._sleep_for_retry, async_cls._sleep_for_retry
+    except (ImportError, AttributeError):
+        return False
+    if getattr(sync_original, "_tradingagents_hook", False):
+        return True
+
+    @functools.wraps(sync_original)
+    def sync_sleep(self, *args, **kwargs):
+        note_retry()
+        return sync_original(self, *args, **kwargs)
+
+    @functools.wraps(async_original)
+    async def async_sleep(self, *args, **kwargs):
+        note_retry()
+        return await async_original(self, *args, **kwargs)
+
+    sync_sleep._tradingagents_hook = async_sleep._tradingagents_hook = True
+    sync_cls._sleep_for_retry, async_cls._sleep_for_retry = sync_sleep, async_sleep
+    return True
+
+
+def install_retry_hooks() -> dict[str, bool]:
+    """Hook the OpenAI and Anthropic SDKs' retries; returns which were hooked.
+
+    An SDK that cannot be hooked must have its retries switched off by the caller
+    (``max_retries=0``), so no retry can bypass the budget.
+    """
+    with _hooks_lock:
+        for name in ("openai", "anthropic"):
+            if not _hooks.get(name):
+                _hooks[name] = _hook_sdk(name)
+        return dict(_hooks)
+
+
+def retry_hook_installed(provider: str) -> bool:
+    sdk = SDK_OF_PROVIDER.get((provider or "").lower(), "openai")
+    return bool(_hooks.get(sdk))
 
 
 def _message_bytes(message: Any) -> int:
@@ -542,6 +702,7 @@ class RunBudget:
         max_day_cost: float | None = None,
         max_reflection_calls: int | None = None,
         max_reflection_tokens: int | None = None,
+        max_external_requests: int | None = None,
         output_reservation: int = DEFAULT_OUTPUT_RESERVATION,
         output_limited: bool = False,
         pricing: Pricing | None = None,
@@ -554,29 +715,37 @@ class RunBudget:
         self.max_day_cost = max_day_cost
         self.max_reflection_calls = max_reflection_calls
         self.max_reflection_tokens = max_reflection_tokens
+        self.max_external_requests = max_external_requests
         self.max_session_cost: float | None = None
         self.output_reservation = output_reservation
         self.output_limited = output_limited
         self.pricing = pricing
         self.ledger_dir = Path(ledger_dir).expanduser() if ledger_dir else None
         self.models = tuple((m[0].lower(), m[1], m[2] if len(m) > 2 else None) for m in models)
+        # (provider, model, endpoint the constructed client calls), from register_clients.
+        self.clients: tuple = ()
         self._lock = threading.RLock()
-        self._current = RunAccount(self)
+        # Calls outside any run land here; it is never ended.
+        self._default = RunAccount(self)
+        self._last = self._default        # the most recent analysis, for usage()
+        self._live: set[RunAccount] = set()
         self._session = _Totals()
         self._inflight: dict[Any, _Reservation] = {}
         # Sticky: spend can no longer be bounded, so every later call is refused.
         self._usage_unreported = False
         self._ledger_broken: str | None = None
-        _install_retry_filter()
+        if self.limited:
+            install_retry_hooks()
 
     @classmethod
     def from_config(cls, config: dict, models: list | tuple = ()) -> RunBudget:
         """Build from a TradingAgents config; fail closed on doubtful cost limits.
 
         ``models`` are the ``(provider, model[, base_url])`` the run will call.
-        With a cost limit set, this raises ``PricingError`` before any model is
-        called unless the pricing, the output limit and every provider and
-        endpoint are suitable (see the module docstring).
+        With a cost limit set this raises ``PricingError`` before any model is
+        called unless the pricing, the output limit and every provider are
+        suitable; ``register_clients`` then checks the endpoints the constructed
+        clients actually call.
         """
         max_calls = _limit(config, "max_llm_calls_per_run", int)
         max_tokens = _limit(config, "max_tokens_per_run", int)
@@ -584,6 +753,7 @@ class RunBudget:
         max_day_cost = _limit(config, "max_cost_per_day_usd", float)
         max_reflection_calls = _limit(config, "max_reflection_calls_per_run", int)
         max_reflection_tokens = _limit(config, "max_reflection_tokens_per_run", int)
+        max_external = _limit(config, "max_external_requests_per_run", int)
         max_age = config.get("max_pricing_age_days")
         max_age = None if max_age in (None, "") else int(max_age)
         per_call_output = _limit(config, "max_tokens", int)
@@ -608,7 +778,7 @@ class RunBudget:
         return cls(
             max_calls=max_calls, max_tokens=max_tokens, max_run_cost=max_run_cost,
             max_day_cost=max_day_cost, max_reflection_calls=max_reflection_calls,
-            max_reflection_tokens=max_reflection_tokens,
+            max_reflection_tokens=max_reflection_tokens, max_external_requests=max_external,
             output_reservation=per_call_output or DEFAULT_OUTPUT_RESERVATION,
             output_limited=per_call_output is not None,
             pricing=pricing, ledger_dir=Path(config.get("data_cache_dir") or ".") / "spend",
@@ -623,21 +793,33 @@ class RunBudget:
 
     @property
     def run_limited(self) -> bool:
-        """Whether any per-analysis allowance is capped."""
+        """Whether any per-run allowance is capped."""
         return any(v is not None for v in (self.max_calls, self.max_tokens, self.max_run_cost,
-                                           self.max_reflection_calls, self.max_reflection_tokens))
+                                           self.max_reflection_calls, self.max_reflection_tokens,
+                                           self.max_external_requests))
 
     @property
     def limited(self) -> bool:
         return self.run_limited or self.cost_limited
 
-    def allowance(self, scope: str) -> tuple[int | None, int | None, float | None]:
-        """(calls, tokens, cost) for an allowance; settlement inherits what it does not set."""
+    def allowance(self, scope: str) -> tuple[int | None, int | None]:
+        """(calls, tokens) for an allowance; settlement inherits what it does not set."""
         if scope == SETTLEMENT:
             calls = self.max_reflection_calls if self.max_reflection_calls is not None else self.max_calls
             tokens = self.max_reflection_tokens if self.max_reflection_tokens is not None else self.max_tokens
-            return calls, tokens, self.max_run_cost
-        return self.max_calls, self.max_tokens, self.max_run_cost
+            return calls, tokens
+        return self.max_calls, self.max_tokens
+
+    def register_clients(self, clients) -> None:
+        """Record the endpoint each constructed client calls; check it under a cost limit.
+
+        ``clients`` are ``(provider, model, llm)``. Raises ``PricingError`` before
+        any call when a cost limit is set and an endpoint is unknown or not the
+        provider's official one.
+        """
+        self.clients = tuple((p.lower(), m, client_endpoint(llm)) for p, m, llm in clients)
+        if self.cost_limited:
+            _require_actual_endpoints(self.clients)
 
     def set_session_cost_limit(self, limit_usd: float | None) -> None:
         """Cap the estimated spend of everything this graph runs (a whole backtest)."""
@@ -651,6 +833,14 @@ class RunBudget:
             )
         _require_cost_limit_support(self.pricing, self.models,
                                     self.output_reservation if self.output_limited else None)
+        _require_actual_endpoints(self.clients)
+        if any(not retry_hook_installed(p) and SDK_OF_PROVIDER.get(p, "openai") in ("openai", "anthropic")
+               for p, _, _ in self.clients):
+            install_retry_hooks()
+            if any(not retry_hook_installed(p) and SDK_OF_PROVIDER.get(p, "openai") in ("openai", "anthropic")
+                   for p, _, _ in self.clients):
+                raise PricingError("a total cost limit needs retries routed through the budget, and the "
+                                   "SDK in use could not be hooked; set llm_max_retries to 0 at graph creation")
         self.max_session_cost = limit
 
     def callback(self, provider: str, model: str) -> BudgetCallback:
@@ -661,48 +851,63 @@ class RunBudget:
 
     @property
     def current(self) -> RunAccount:
-        return self._current
+        """The account bound to the calling context, else the most recent analysis."""
+        owner = _owner.get()
+        return owner if owner is not None and owner.budget is self else self._last
 
-    def begin_run(self, persist_path: str | Path | None = None, restore: bool = False) -> RunAccount:
-        """Start a new analysis; the previous one ends, its late calls refused.
+    def begin_run(self, persist_path: str | Path | None = None, restore: bool = False,
+                  kind: str = ANALYSIS) -> RunAccount:
+        """Start an account. Never ends another: concurrent runs stay independent.
 
-        ``persist_path`` keeps the account's usage in a file (beside a checkpoint).
-        With ``restore``, the usage already in that file is continued: a missing
-        or unreadable record is refused while any per-analysis limit is set, since
-        a resumed analysis must not get a fresh allowance.
+        ``persist_path`` keeps the account's usage, and its in-flight reservations,
+        in a file (beside a checkpoint). With ``restore``, the usage already in that
+        file is continued: a missing, incomplete or malformed record is refused
+        while any limit is set, since a resumed analysis must not get a fresh
+        allowance.
         """
         with self._lock:
-            self._current.ended = True
-            account = RunAccount(self, Path(persist_path) if persist_path else None)
+            account = RunAccount(self, Path(persist_path) if persist_path else None, kind)
             if restore and account.persist_path is not None:
                 try:
                     account.load()
                 except (OSError, ValueError) as exc:
                     problem = ("missing" if isinstance(exc, FileNotFoundError)
-                               else f"unreadable ({type(exc).__name__})")
-                    if self.run_limited or self.cost_limited:
+                               else f"unreadable or incomplete ({type(exc).__name__}: {exc})")
+                    if self.limited:
                         raise LLMBudgetExceeded(
                             "resume", f"the saved LLM usage for this checkpoint is {problem}, so resuming it "
                             "could exceed its limits; start fresh with --clear-checkpoints", {}) from None
                     logger.warning("Saved LLM usage for this checkpoint is %s; counting from zero", problem)
-            account.save()
-            self._current = account
+            if not account.save() and self.limited:
+                raise LLMBudgetExceeded("usage_record", account.broken or "usage record not saved", {})
+            self._live.add(account)
+            if kind == ANALYSIS:
+                self._last = account
             return account
 
-    def end_run(self, account: RunAccount | None = None) -> None:
-        """Mark ``account`` (default: the current one) ended; its later calls are refused."""
-        with self._lock:
-            (account or self._current).ended = True
+    def end_run(self, account: RunAccount, completed: bool = False) -> None:
+        """End ``account``, and only it.
 
-    def bound(self, account: RunAccount | None = None):
-        """Context manager binding ``account`` (default: current) to the calling context."""
-        budget = self
+        With ``completed`` (its graph returned normally, so every call it made has
+        ended or failed), a reservation still open never reached the provider: a
+        callback before the budget's aborted the call. It is released, not charged.
+        """
+        with self._lock:
+            account.ended = True
+            self._live.discard(account)
+            if completed:
+                for run_id, reservation in list(self._inflight.items()):
+                    if reservation.account is account:
+                        self._release(run_id, reservation)
+
+    def bound(self, account: RunAccount):
+        """Context manager binding ``account`` to the calling context."""
 
         @contextlib.contextmanager
         def scope():
-            token = _owner.set(account or budget._current)
+            token = _owner.set(account)
             try:
-                yield
+                yield account
             finally:
                 _owner.reset(token)
 
@@ -711,14 +916,15 @@ class RunBudget:
     # --- reporting -----------------------------------------------------------
 
     def summary(self, session: bool = False, account: RunAccount | None = None) -> dict:
-        """Usage of a run (default: the current one) or of the whole session."""
+        """Usage of a run (default: the bound one, else the most recent) or the session."""
         with self._lock:
             if session:
                 totals, by_scope = self._session, None
             else:
-                account = account or self._current
+                account = account or self.current
                 totals, by_scope = account.total, account.scopes
             priced = self.pricing is not None
+            body = _totals_summary(totals, priced)
             summary = {
                 "limits": {
                     "max_llm_calls_per_run": self.max_calls,
@@ -727,13 +933,15 @@ class RunBudget:
                     "max_cost_per_day_usd": self.max_day_cost,
                     "max_reflection_calls_per_run": self.allowance(SETTLEMENT)[0],
                     "max_reflection_tokens_per_run": self.allowance(SETTLEMENT)[1],
+                    "max_external_requests_per_run": self.max_external_requests,
                     "max_total_cost_usd": self.max_session_cost,
                     "per_call_output_reservation": self.output_reservation,
                 },
-                **_totals_summary(totals, priced),
+                **body,
                 "external_paid_requests": totals.external_requests,
+                "unresolved_reservations_recovered": totals.unresolved_recovered,
                 "cost_usd": {
-                    **_totals_summary(totals, priced)["cost_usd"],
+                    **body["cost_usd"],
                     "estimated_basis": (
                         f"counted tokens x prices in {Path(self.pricing.path).name} as of {self.pricing.as_of}"
                         if priced else "no valid pricing file, so no estimate"
@@ -757,25 +965,27 @@ class RunBudget:
     def _account_for_call(self) -> RunAccount:
         owner = _owner.get()
         if owner is not None and owner.budget is self:
-            if owner.ended:
+            if owner.ended and self.limited:
                 self._refuse("run_ended", "a call from an analysis that has already ended was refused",
                              owner)
             return owner
-        return self._current
+        return self._default
 
     def _start(self, run_id: Any, provider: str, model: str, prompt_bytes: int) -> None:
         with self._lock:
             account = self._account_for_call()
             scope = _scope.get()
             totals, session = account.scopes[scope], self._session
-            max_calls, max_tokens, max_cost = self.allowance(scope)
+            max_calls, max_tokens = self.allowance(scope)
             prefix = "reflection_" if scope == SETTLEMENT else ""
             label = "reflection" if scope == SETTLEMENT else "analysis"
             input_estimate = estimate_tokens(prompt_bytes)
             projected_tokens = input_estimate + self.output_reservation
             price = self.pricing.price(provider, model) if self.pricing else None
-            projected_cost = price.cost(input_estimate, self.output_reservation) if price else 0.0
-            same = [r for r in self._inflight.values() if r.account is account and r.scope == scope]
+            projected_cost = (price.reservation(prompt_bytes, input_estimate, self.output_reservation, provider)
+                              if price else 0.0)
+            same_scope = [r for r in self._inflight.values() if r.account is account and r.scope == scope]
+            same_run = [r for r in self._inflight.values() if r.account is account]
 
             if account.broken and self.limited:
                 self._refuse("usage_record", account.broken, account)
@@ -783,38 +993,57 @@ class RunBudget:
                 self._refuse(f"{prefix}calls", f"LLM call limit reached: {max_calls} per {label} "
                              f"({'TRADINGAGENTS_MAX_REFLECTION_CALLS' if prefix else 'TRADINGAGENTS_MAX_LLM_CALLS'})",
                              account)
-            if max_tokens is not None and totals.tokens + sum(r.tokens for r in same) + projected_tokens > max_tokens:
+            if (max_tokens is not None
+                    and totals.tokens + sum(r.tokens for r in same_scope) + projected_tokens > max_tokens):
                 self._refuse(f"{prefix}tokens", f"token limit would be exceeded: {max_tokens:,} per {label}; "
                              f"{totals.tokens:,} counted so far, this call reserves up to {projected_tokens:,}",
                              account)
             if self.cost_limited:
-                if self._usage_unreported:
-                    self._refuse("usage_unreported", "a provider response carried no token usage, so spend "
-                                 "can no longer be bounded; cost limits fail closed", account)
-                if self._ledger_broken:
-                    self._refuse("ledger", self._ledger_broken, account)
-                if price is None:
-                    self._refuse("pricing", f"no price for {provider}:{model} in the pricing file; "
-                                 "cost limits fail closed", account)
-                if max_cost is not None and totals.charged_cost + sum(r.cost for r in same) + projected_cost > max_cost:
-                    self._refuse("reflection_cost" if prefix else "run_cost",
-                                 f"estimated cost limit would be exceeded: ${max_cost:.4f} per {label} "
-                                 f"(TRADINGAGENTS_MAX_COST_PER_RUN); ${totals.charged_cost:.4f} charged so far, "
-                                 f"this call reserves up to ${projected_cost:.4f}", account)
-                inflight_cost = sum(r.cost for r in self._inflight.values())
-                if (self.max_session_cost is not None
-                        and session.charged_cost + inflight_cost + projected_cost > self.max_session_cost):
-                    self._refuse("session_cost", f"total estimated cost limit would be exceeded: "
-                                 f"${self.max_session_cost:.4f}; ${session.charged_cost:.4f} charged so far",
-                                 account)
-            ledger = self._ledger_reserve(run_id, projected_cost, account) if price is not None else None
+                self._check_cost(account, price, provider, model, projected_cost, same_run)
+            ledger = None
+            if price is not None:
+                ledger = self._ledger_reserve(projected_cost, account)
 
+            key = uuid.uuid4().hex
             totals.attempted += 1
             session.attempted += 1
-            self._inflight[run_id] = _Reservation(account, scope, provider, model, price, input_estimate,
-                                                  projected_tokens, projected_cost, ledger)
-            account.save()
+            reservation = _Reservation(account, scope, provider, model, price, prompt_bytes, input_estimate,
+                                       projected_tokens, projected_cost, ledger, key)
+            account.inflight[key] = {"scope": scope, "tokens": projected_tokens, "cost": projected_cost}
+            # The reservation is on disk before the request is sent, so a crash
+            # from here on is recovered as spent.
+            if not account.save() and self.limited:
+                account.inflight.pop(key, None)
+                totals.attempted -= 1
+                session.attempted -= 1
+                self._ledger_release(ledger)
+                self._refuse("usage_record", account.broken or "usage record not saved", account)
+            self._inflight[run_id] = reservation
             _active.call = (self, run_id)
+
+    def _check_cost(self, account: RunAccount, price: ModelPrice | None, provider: str, model: str,
+                    projected_cost: float, same_run: list) -> None:
+        if self._usage_unreported:
+            self._refuse("usage_unreported", "a provider response carried no token usage, so spend "
+                         "can no longer be bounded; cost limits fail closed", account)
+        if self._ledger_broken:
+            self._refuse("ledger", self._ledger_broken, account)
+        if price is None:
+            self._refuse("pricing", f"no price for {provider}:{model} in the pricing file; "
+                         "cost limits fail closed", account)
+        # One ceiling per run: the analysis and its reflections together.
+        run_charged = account.total.charged_cost
+        if (self.max_run_cost is not None
+                and run_charged + sum(r.cost for r in same_run) + projected_cost > self.max_run_cost):
+            self._refuse("run_cost", f"estimated cost limit would be exceeded: ${self.max_run_cost:.4f} per "
+                         f"run, analysis and reflections together (TRADINGAGENTS_MAX_COST_PER_RUN); "
+                         f"${run_charged:.4f} charged so far, this reserves up to ${projected_cost:.4f}", account)
+        inflight_cost = sum(r.cost for r in self._inflight.values())
+        if (self.max_session_cost is not None
+                and self._session.charged_cost + inflight_cost + projected_cost > self.max_session_cost):
+            self._refuse("session_cost", f"total estimated cost limit would be exceeded: "
+                         f"${self.max_session_cost:.4f}; ${self._session.charged_cost:.4f} charged so far",
+                         account)
 
     def _end(self, run_id: Any, response: Any) -> None:
         with self._lock:
@@ -822,7 +1051,8 @@ class RunBudget:
             self._clear_active(run_id)
             if reservation is None:
                 return
-            totals = reservation.account.scopes[reservation.scope]
+            account = reservation.account
+            totals = account.scopes[reservation.scope]
             usage = _usage_of(response)
             reported_cost = _reported_cost_of(response)
             for t in (totals, self._session):
@@ -849,7 +1079,8 @@ class RunBudget:
             estimated = price.cost(tokens_in, tokens_out, cached, written) if price else None
             charge = self._charge(totals, estimated, reported_cost)
             self._ledger_settle(reservation.ledger, charge)
-            reservation.account.save()
+            account.inflight.pop(reservation.key, None)
+            account.save()
 
     def _error(self, run_id: Any) -> None:
         with self._lock:
@@ -857,15 +1088,31 @@ class RunBudget:
             self._clear_active(run_id)
             if reservation is None:
                 return
-            totals = reservation.account.scopes[reservation.scope]
+            account = reservation.account
+            totals = account.scopes[reservation.scope]
             for t in (totals, self._session):
                 t.failed += 1
             charge = self._charge_input_estimate(totals, reservation)
             self._ledger_settle(reservation.ledger, charge)
-            reservation.account.save()
+            account.inflight.pop(reservation.key, None)
+            account.save()
+
+    def _release(self, run_id: Any, reservation: _Reservation) -> None:
+        """A reservation whose request never started: undo it without charging."""
+        self._inflight.pop(run_id, None)
+        account = reservation.account
+        for t in (account.scopes[reservation.scope], self._session):
+            t.attempted = max(0, t.attempted - 1)
+        self._ledger_release(reservation.ledger)
+        account.inflight.pop(reservation.key, None)
+        account.save()
 
     def _retry(self, run_id: Any) -> None:
-        """An SDK is about to retry this call: refuse it, or count and charge it."""
+        """A client is about to retry this call: refuse it, or count and charge it.
+
+        Checked like a new call: the per-allowance call and token limits, the run's
+        cost ceiling, and the session and daily limits.
+        """
         with self._lock:
             reservation = self._inflight.get(run_id)
             if reservation is None:
@@ -873,23 +1120,37 @@ class RunBudget:
                 return
             account, scope = reservation.account, reservation.scope
             totals = account.scopes[scope]
-            max_calls, max_tokens, max_cost = self.allowance(scope)
+            max_calls, max_tokens = self.allowance(scope)
             prefix = "reflection_" if scope == SETTLEMENT else ""
-            retry_cost = reservation.price.cost(reservation.input_estimate, 0) if reservation.price else 0.0
+            retry_cost = (reservation.price.reservation(reservation.prompt_bytes, reservation.input_estimate, 0,
+                                                        reservation.provider) if reservation.price else 0.0)
+            others = [r for r in self._inflight.values() if r is not reservation]
+            same_scope = [r for r in others if r.account is account and r.scope == scope]
             if max_calls is not None and totals.attempted + totals.sdk_retries + 1 > max_calls:
-                self._refuse(f"{prefix}calls", f"SDK retry refused: the LLM call limit ({max_calls}) is reached",
+                self._refuse(f"{prefix}calls", f"retry refused: the LLM call limit ({max_calls}) is reached",
                              account)
-            if max_tokens is not None and totals.tokens + reservation.input_estimate > max_tokens:
-                self._refuse(f"{prefix}tokens", f"SDK retry refused: the token limit ({max_tokens:,}) "
+            if (max_tokens is not None and totals.tokens + sum(r.tokens for r in same_scope)
+                    + reservation.tokens + reservation.input_estimate > max_tokens):
+                self._refuse(f"{prefix}tokens", f"retry refused: the token limit ({max_tokens:,}) "
                              "would be exceeded", account)
-            if self.cost_limited and max_cost is not None and totals.charged_cost + retry_cost > max_cost:
-                self._refuse("reflection_cost" if prefix else "run_cost",
-                             "SDK retry refused: the estimated cost limit would be exceeded", account)
+            if self.cost_limited:
+                in_flight_run = sum(r.cost for r in self._inflight.values() if r.account is account)
+                if (self.max_run_cost is not None
+                        and account.total.charged_cost + in_flight_run + retry_cost > self.max_run_cost):
+                    self._refuse("run_cost", "retry refused: the run's estimated cost limit would be exceeded",
+                                 account)
+                in_flight_all = sum(r.cost for r in self._inflight.values())
+                if (self.max_session_cost is not None
+                        and self._session.charged_cost + in_flight_all + retry_cost > self.max_session_cost):
+                    self._refuse("session_cost", "retry refused: the total estimated cost limit would be "
+                                 "exceeded", account)
+            if reservation.price is not None:
+                self._ledger_charge(retry_cost, account, check=True)
             for t in (totals, self._session):
                 t.sdk_retries += 1
-            charge = self._charge_input_estimate(totals, reservation)
-            if charge:
-                self._ledger_add(charge)
+                t.estimated_unreported += reservation.input_estimate
+            estimated = retry_cost if reservation.price else None
+            self._charge(totals, estimated, None)
             account.save()
 
     def _external(self, account: RunAccount, service: str, requests: int) -> None:
@@ -897,15 +1158,22 @@ class RunBudget:
             if self.cost_limited:
                 self._refuse("pricing", f"{service} requests are billed outside the pricing file, so they "
                              "are not made while a cost limit is set", account)
-            for t in (account.scopes[ANALYSIS], self._session):
+            totals = account.scopes[ANALYSIS]
+            if (self.max_external_requests is not None
+                    and account.total.external_requests + requests > self.max_external_requests):
+                self._refuse("external_requests", f"{service}: the external request limit "
+                             f"({self.max_external_requests} per run, TRADINGAGENTS_MAX_EXTERNAL_REQUESTS) "
+                             "is reached", account)
+            for t in (totals, self._session):
                 t.external_requests += requests
             account.save()
 
     def _charge_input_estimate(self, totals: _Totals, reservation: _Reservation) -> float:
-        """A failed request or a retry: the provider may have read the prompt."""
+        """A failed request: the provider may have read the prompt."""
         for t in (totals, self._session):
             t.estimated_unreported += reservation.input_estimate
-        estimated = reservation.price.cost(reservation.input_estimate, 0) if reservation.price else None
+        estimated = (reservation.price.reservation(reservation.prompt_bytes, reservation.input_estimate, 0,
+                                                   reservation.provider) if reservation.price else None)
         return self._charge(totals, estimated, None)
 
     def _charge(self, totals: _Totals, estimated: float | None, reported: float | None) -> float:
@@ -969,56 +1237,71 @@ class RunBudget:
             self._refuse("ledger", f"{problem}; cost limits fail closed", account)
         logger.error("LLM budget: %s; this spend is not recorded", problem)
 
-    def _ledger_reserve(self, run_id: Any, projected_cost: float, account: RunAccount) -> tuple[Path, str] | None:
-        """Reserve the call's worst-case cost, checking the daily limit atomically across processes."""
-        path, key = self._ledger_path(), f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    def _ledger_update(self, path: Path, change, account: RunAccount | None) -> bool:
+        """Read-modify-write the ledger under its cross-process lock."""
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with locked(path):
                 data = self._ledger_read(path)
-                spent = data["charged_usd"] + sum(data["reserved"].values())
-                if self.max_day_cost is not None and spent + projected_cost > self.max_day_cost:
-                    self._refuse("day_cost", f"daily estimated cost limit would be exceeded: "
-                                 f"${self.max_day_cost:.4f} per UTC day (TRADINGAGENTS_MAX_COST_PER_DAY); "
-                                 f"${spent:.4f} charged or reserved today", account)
-                data["reserved"][key] = projected_cost
+                change(data)
                 self._ledger_write(path, data)
+            return True
         except _LedgerError as exc:
             self._ledger_failed(str(exc), account)
-            return None
         except OSError as exc:
             self._ledger_failed(f"the daily spend ledger lock failed ({type(exc).__name__})", account)
-            return None
-        return path, key
+        return False
+
+    def _check_day(self, data: dict, amount: float, account: RunAccount | None) -> None:
+        spent = data["charged_usd"] + sum(data["reserved"].values())
+        if self.max_day_cost is not None and spent + amount > self.max_day_cost:
+            self._refuse("day_cost", f"daily estimated cost limit would be exceeded: "
+                         f"${self.max_day_cost:.4f} per UTC day (TRADINGAGENTS_MAX_COST_PER_DAY); "
+                         f"${spent:.4f} charged or reserved today", account)
+
+    def _ledger_reserve(self, projected_cost: float, account: RunAccount) -> tuple[Path, str] | None:
+        """Reserve a call's worst-case cost, checking the daily limit atomically across processes."""
+        path, key = self._ledger_path(), f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
+
+        def reserve(data):
+            self._check_day(data, projected_cost, account)
+            data["reserved"][key] = projected_cost
+
+        return (path, key) if self._ledger_update(path, reserve, account) else None
+
+    def _ledger_charge(self, amount: float, account: RunAccount | None, check: bool) -> None:
+        """Charge a retry: checked against the daily limit first, like a call."""
+        def charge(data):
+            if check:
+                self._check_day(data, amount, account)
+            data["charged_usd"] = round(data["charged_usd"] + amount, 8)
+
+        self._ledger_update(self._ledger_path(), charge, account)
 
     def _ledger_settle(self, ledger: tuple[Path, str] | None, charge: float) -> None:
         """Replace a call's reservation with what it was charged."""
         if ledger is None:
             return
         path, key = ledger
-        try:
-            with locked(path):
-                data = self._ledger_read(path)
-                data["reserved"].pop(key, None)
-                data["charged_usd"] = round(data["charged_usd"] + charge, 8)
-                data["calls"] += 1
-                self._ledger_write(path, data)
-        except (_LedgerError, OSError) as exc:
-            # The call has happened; what matters is that the next one is refused.
-            problem = str(exc) if isinstance(exc, _LedgerError) else f"ledger lock failed ({type(exc).__name__})"
-            if self.cost_limited:
-                self._ledger_broken = problem
-            logger.error("LLM budget: %s", problem)
 
-    def _ledger_add(self, charge: float) -> None:
-        if self.pricing is None:
-            return
-        path = self._ledger_path()
+        def settle(data):
+            data["reserved"].pop(key, None)
+            data["charged_usd"] = round(data["charged_usd"] + charge, 8)
+            data["calls"] += 1
+
+        self._ledger_after_call(path, settle)
+
+    def _ledger_release(self, ledger: tuple[Path, str] | None) -> None:
+        if ledger is not None:
+            path, key = ledger
+            self._ledger_after_call(path, lambda data: data["reserved"].pop(key, None))
+
+    def _ledger_after_call(self, path: Path, change) -> None:
+        # The call has happened (or is being undone); a failure must stop the next one.
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
             with locked(path):
                 data = self._ledger_read(path)
-                data["charged_usd"] = round(data["charged_usd"] + charge, 8)
+                change(data)
                 self._ledger_write(path, data)
         except (_LedgerError, OSError) as exc:
             problem = str(exc) if isinstance(exc, _LedgerError) else f"ledger lock failed ({type(exc).__name__})"
@@ -1067,7 +1350,7 @@ def describe_usage(summary: dict) -> str:
     reflections = (summary.get("by_allowance") or {}).get(SETTLEMENT, {}).get("calls", {}).get("attempted")
     of_which = f", {reflections} of them reflections" if reflections else ""
     return (f"{calls['attempted']} LLM call(s){of_which} ({calls['failed']} failed, "
-            f"{calls['sdk_retries']} SDK retries), "
+            f"{calls['sdk_retries']} retries), "
             f"{tokens['counted_total']:,} tokens counted ({tokens['estimated_unreported']:,} estimated), "
             f"{estimated}{reported}")
 
@@ -1084,7 +1367,7 @@ def _require_cost_limit_support(pricing: Pricing, models, per_call_output: int |
         if provider not in COST_LIMIT_PROVIDERS:
             raise PricingError(
                 f"cost limits are not supported for provider {provider!r}: its client does not reliably "
-                "honour max_tokens or report token usage (supported: "
+                "honour max_tokens or report token usage, or could not be verified (supported: "
                 f"{', '.join(sorted(COST_LIMIT_PROVIDERS))})"
             )
         if not endpoint_supported(provider, base_url):
@@ -1099,8 +1382,28 @@ def _require_cost_limit_support(pricing: Pricing, models, per_call_output: int |
             )
 
 
+def _require_actual_endpoints(clients) -> None:
+    for provider, model, endpoint in clients:
+        if endpoint is None:
+            raise PricingError(
+                f"cost limits need to know where {provider}:{model} sends requests, and its client's "
+                "endpoint could not be determined; cost limits fail closed"
+            )
+        if not endpoint_supported(provider, endpoint):
+            host = urlparse(endpoint).hostname or "an unknown host"
+            raise PricingError(
+                f"cost limits are not supported for {provider}:{model}: its client sends requests to "
+                f"{host}, not the provider's official endpoint (check *_BASE_URL environment variables)"
+            )
+
+
 class BudgetCallback(BaseCallbackHandler):
-    """Attached to one model client; every call it makes goes through the budget."""
+    """Attached to one model client; every call it makes goes through the budget.
+
+    It must be the last callback the client holds (``TradingAgentsGraph`` appends
+    it after the caller's): a callback after it could abort a call it has already
+    reserved for.
+    """
 
     # Raise out of invoke() instead of LangChain logging and continuing.
     raise_error = True
@@ -1151,7 +1454,8 @@ class BudgetCallback(BaseCallbackHandler):
 
 __all__ = [
     "BUDGET_CONFIG_KEYS", "BudgetCallback", "COST_LIMIT_PROVIDERS", "LLMBudgetExceeded", "ModelPrice",
-    "Pricing", "PricingError", "RunAccount", "RunBudget", "bind_owner", "current_account",
-    "describe_usage", "endpoint_supported", "estimate_tokens", "load_pricing",
-    "meter_external_requests", "reset_owner", "settlement_scope",
+    "Pricing", "PricingError", "Rates", "RunAccount", "RunBudget", "bind_owner", "client_endpoint",
+    "current_account", "describe_usage", "endpoint_supported", "estimate_tokens", "install_retry_hooks",
+    "load_pricing", "meter_external_requests", "note_retry", "reset_owner", "retry_hook_installed",
+    "settlement_scope",
 ]

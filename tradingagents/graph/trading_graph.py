@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -12,16 +13,20 @@ from tradingagents.agents.context import build_instrument_context, resolve_instr
 from tradingagents.agents.rating import run_rating
 from tradingagents.dataflows.config import run_config, run_config_context, set_config
 from tradingagents.dataflows.date_window import get_current_date, is_historical
+from tradingagents.dataflows.files import locked
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_tier_client, tier_provider
 from tradingagents.llm_clients.budget import (
     BUDGET_CONFIG_KEYS,
+    DEFAULT_BUDGET_RETRIES,
+    SETTLEMENT,
     LLMBudgetExceeded,
     RunBudget,
     bind_owner as _bind_budget_owner,
     current_account as _budget_owner,
     reset_owner as _reset_budget_owner,
+    retry_hook_installed,
     settlement_scope,
 )
 from tradingagents.logsafe import register_url_secrets
@@ -35,6 +40,11 @@ from .propagation import Propagator
 from .setup import GraphSetup
 
 logger = logging.getLogger(__name__)
+
+# The budget account begin_checkpoint started (fresh, or restored from the
+# checkpoint's saved usage) for the run create_run_state is about to build. Kept
+# in the caller's context, so concurrent runs on one graph never share it.
+_prepared_account: ContextVar = ContextVar("tradingagents_prepared_account", default=None)
 
 
 def _tier_endpoint(config: dict, tier: str) -> str | None:
@@ -103,15 +113,16 @@ class TradingAgentsGraph:
         for _, _, endpoint in tiers.values():
             register_url_secrets(endpoint)
         self.budget = RunBudget.from_config(self.config, list(tiers.values()))
-        self.deep_thinking_llm = create_tier_client(
-            self.config, "deep", callbacks=[*self.callbacks, self.budget.callback(*tiers["deep"][:2])]
-        ).get_llm()
-        self.quick_thinking_llm = create_tier_client(
-            self.config, "quick", callbacks=[*self.callbacks, self.budget.callback(*tiers["quick"][:2])]
-        ).get_llm()
-        # Set by begin_checkpoint when it has already started this run's budget
-        # account (fresh, or restored from the checkpoint's saved usage).
-        self._budget_prepared = False
+        # The budget's callback goes last, after the caller's, so no callback can
+        # abort a call after the budget has reserved for it.
+        self.deep_thinking_llm = self._tier_llm("deep", tiers["deep"])
+        self.quick_thinking_llm = self._tier_llm("quick", tiers["quick"])
+        # Where each constructed client really sends requests (environment
+        # overrides included); a cost limit refuses an unofficial endpoint here,
+        # before any call.
+        self.budget.register_clients([(tiers["deep"][0], tiers["deep"][1], self.deep_thinking_llm),
+                                      (tiers["quick"][0], tiers["quick"][1], self.quick_thinking_llm)])
+        self._usage_lock = None
 
         self.memory_log = TradingMemoryLog(self.config)
 
@@ -147,6 +158,27 @@ class TradingAgentsGraph:
         self.graph = self.workflow.compile()
         self._checkpointer_ctx = None
         self._resuming = False
+
+    def _tier_llm(self, tier: str, spec):
+        """A tier's chat model, with its retries under the budget when limits are on.
+
+        With every limit off the client is built exactly as before. With limits,
+        Google and Bedrock clients switch their own retries off and retry through
+        the TradingAgents wrapper, which asks the budget first; an OpenAI- or
+        Anthropic-SDK client whose retries could not be hooked gets none at all.
+        """
+        provider, model = spec[0], spec[1]
+        config, extra = self.config, {"callbacks": [*self.callbacks, self.budget.callback(provider, model)]}
+        if self.budget.limited:
+            if provider in ("google", "bedrock"):
+                configured = self.config.get("llm_max_retries")
+                extra["budget_controlled_retries"] = (
+                    int(configured) if configured not in (None, "") else DEFAULT_BUDGET_RETRIES)
+            elif not retry_hook_installed(provider):
+                logger.warning("The %s SDK's retries could not be routed through the budget; "
+                               "retries are off for this run", provider)
+                config = {**self.config, "llm_max_retries": 0}
+        return create_tier_client(config, tier, **extra).get_llm()
 
     def resolve_instrument_context(self, ticker: str, asset_type: str = "stock",
                                    trade_date: str | None = None) -> str:
@@ -238,6 +270,12 @@ class TradingAgentsGraph:
         if not self.config.get("checkpoint_enabled"):
             return None
         signature = self._run_signature(asset_type, portfolio)
+        budget = getattr(self, "budget", None)
+        record = usage_path(self.config["data_cache_dir"], company_name, str(trade_date), signature)
+        # The checkpoint is this run's alone from here on (see _lock_usage_record),
+        # before its database is even opened.
+        if budget is not None:
+            self._lock_usage_record(record, budget)
         self._checkpointer_ctx = get_checkpointer(self.config["data_cache_dir"], company_name)
         saver = self._checkpointer_ctx.__enter__()
         self.graph = self.workflow.compile(checkpointer=saver)
@@ -249,17 +287,21 @@ class TradingAgentsGraph:
         # The analysis's LLM usage lives beside its checkpoint: a resume continues
         # from what was already spent instead of a fresh allowance (refused when
         # the record is missing or unreadable and a limit is set).
-        budget = getattr(self, "budget", None)
         if budget is not None:
-            record = usage_path(self.config["data_cache_dir"], company_name, str(trade_date), signature)
-            if not self._resuming:
-                record.unlink(missing_ok=True)
             try:
-                budget.begin_run(persist_path=record, restore=self._resuming)
+                if not self._resuming:
+                    record.unlink(missing_ok=True)
+                account = budget.begin_run(persist_path=record, restore=self._resuming)
             except LLMBudgetExceeded:
                 self.end_checkpoint()
                 raise
-            self._budget_prepared = True
+            # An account create_run_state already started for this run (the CLI
+            # order) made no calls; this one replaces it.
+            earlier = _budget_owner()
+            if earlier is not None and earlier.budget is budget and earlier is not account:
+                budget.end_run(earlier, completed=True)
+            _bind_budget_owner(account)
+            _prepared_account.set(account)
         if step is not None:
             logger.info("Resuming from step %d for %s on %s", step, company_name, trade_date)
         else:
@@ -276,9 +318,30 @@ class TradingAgentsGraph:
         """
         return None if self._resuming else init_state
 
+    def _lock_usage_record(self, record: Path, budget) -> None:
+        """Hold the checkpoint's usage record for this run alone (until end_checkpoint).
+
+        Two processes resuming one checkpoint would each continue its usage and
+        together get twice the allowance, so with limits on the second is refused.
+        """
+        holder = locked(record, wait=False)
+        if holder.__enter__():
+            self._usage_lock = holder
+            return
+        holder.__exit__(None, None, None)
+        if budget.limited:
+            raise LLMBudgetExceeded("resume_in_progress", "another process is already running this "
+                                    "checkpoint; resuming it twice would double its LLM allowance", {})
+
     def end_checkpoint(self):
         """Restore the plain uncheckpointed graph after a checkpointed run."""
-        self._budget_prepared = False
+        # The run's budget binding ends with the run (create_run_state and
+        # begin_checkpoint set it in the caller's context).
+        _prepared_account.set(None)
+        _bind_budget_owner(None)
+        if getattr(self, "_usage_lock", None) is not None:
+            self._usage_lock.__exit__(None, None, None)
+            self._usage_lock = None
         if self._checkpointer_ctx is not None:
             self._checkpointer_ctx.__exit__(None, None, None)
             self._checkpointer_ctx = None
@@ -347,13 +410,17 @@ class TradingAgentsGraph:
         and loads them alongside the analysts (see ``_memory_step``).
         """
         trade_date = _validate_trade_date(trade_date)
-        # Limits are per analysis: a backtest reuses one graph over many runs.
-        # begin_checkpoint may already have started (or restored) this run's account.
-        if getattr(self, "budget", None) is not None:
-            if getattr(self, "_budget_prepared", False):
-                self._budget_prepared = False
+        # Each analysis is its own budget account, bound to the caller's context
+        # (so concurrent runs on one graph stay apart). begin_checkpoint may already
+        # have started, or restored, this run's account.
+        budget = getattr(self, "budget", None)
+        if budget is not None:
+            account = _prepared_account.get()
+            if account is not None and account.budget is budget and not account.ended:
+                _prepared_account.set(None)
             else:
-                self.budget.begin_run()
+                account = budget.begin_run()
+            _bind_budget_owner(account)
         return self.propagator.create_initial_state(
             company_name,
             trade_date,
@@ -421,15 +488,37 @@ class TradingAgentsGraph:
     def _settlement_budget(self):
         """Reflections draw on the settlement allowance, apart from the analysts' calls.
 
-        Inside a run (the Memory Log step) that is the run's own settlement
-        allowance; called on its own (after a backtest grid, from a scheduler) it
-        is a fresh account, so it never inherits what the last analysis left.
+        Inside a run (the Memory Log step) or a ``settlement_session`` they use that
+        account's settlement allowance. Called on its own (a scheduler), a pass gets
+        an independent account of its own, which ends with it and touches no other.
         """
         budget = getattr(self, "budget", None)
-        if budget is not None and _budget_owner() is None:
-            budget.begin_run()
-        with settlement_scope():
+        owner = _budget_owner()
+        if budget is None or (owner is not None and owner.budget is budget and not owner.ended):
+            with settlement_scope():
+                yield
+            return
+        with self.settlement_session():
             yield
+
+    @contextmanager
+    def settlement_session(self):
+        """One independent budget account for a series of settlement passes
+        (the end of a backtest grid): every reflection inside shares it."""
+        budget = getattr(self, "budget", None)
+        if budget is None:
+            yield None
+            return
+        account = budget.begin_run(kind=SETTLEMENT)
+        token = _bind_budget_owner(account)
+        completed = False
+        try:
+            with settlement_scope():
+                yield account
+            completed = True
+        finally:
+            _reset_budget_owner(token)
+            budget.end_run(account, completed=completed)
 
     def record_decision(self, company_name, trade_date, final_state):
         """Record a finished run: its state log, and its decision in the memory log
@@ -458,17 +547,17 @@ class TradingAgentsGraph:
 
         # None resumes an existing checkpoint; init_agent_state starts fresh (#1249).
         graph_input = self.checkpoint_input(init_agent_state)
+        # create_run_state bound this run's account to the context, which LangGraph
+        # carries into its worker threads; the run ends that account, and only it.
         budget = getattr(self, "budget", None)
-        account = budget.current if budget is not None else None
-        # Every call the graph makes, in any worker thread, belongs to this run;
-        # once it ends, a call still coming from it is refused, not charged to the next.
-        token = _bind_budget_owner(account) if account is not None else None
+        account = _budget_owner() if budget is not None else None
+        completed = False
         try:
             final_state = self._execute(graph_input, args)
+            completed = True
         finally:
-            if token is not None:
-                _reset_budget_owner(token)
-                budget.end_run(account)
+            if account is not None and account.budget is budget:
+                budget.end_run(account, completed=completed)
 
         self.record_decision(company_name, trade_date, final_state)
 
@@ -508,11 +597,12 @@ class TradingAgentsGraph:
         # The graph's own config serves every tool call, as in propagate(), even
         # when the process-wide config has changed since. Each step runs in the
         # run's context, so the caller keeps its own between steps.
+        # The copied context carries the run's budget account (bound by
+        # create_run_state) into every step; the run ends that account only.
         context = run_config_context(self.config)
         budget = getattr(self, "budget", None)
-        account = budget.current if budget is not None else None
-        if account is not None:
-            context.run(_bind_budget_owner, account)
+        account = _budget_owner() if budget is not None else None
+        completed = False
         stream = context.run(self.graph.stream, graph_input, subgraphs=True, **args)
         try:
             while (step := context.run(next, stream, None)) is not None:
@@ -525,10 +615,11 @@ class TradingAgentsGraph:
                             yield result.get("messages", []), report or None
                 elif mode == "values":
                     yield chunk.get("messages", []), chunk
+            completed = True
         finally:
             context.run(stream.close)
-            if account is not None:
-                budget.end_run(account)
+            if account is not None and account.budget is budget:
+                budget.end_run(account, completed=completed)
 
     def usage(self, session: bool = False) -> dict:
         """LLM calls, tokens and cost of the current run, or of every run this graph made."""

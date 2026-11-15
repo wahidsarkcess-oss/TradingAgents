@@ -64,11 +64,11 @@ _PATTERNS = [
     re.compile(r"(?:ghp|gho|ghs|ghu)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"),
     re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}"),  # JWT
     re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=\-]{8,}"),
-    re.compile(r"(?i)([?&](?:api_?key|apikey|key|token|access_token|refresh_token|client_secret|"
+    re.compile(r"(?i)([?&](?:api[_-]?key|apikey|key|token|access_token|refresh_token|client_secret|"
                r"sig|signature|password|auth)=)[^&\s\"'<>]+"),
     re.compile(r"(?:hf_|glpat-|GOCSPX-|npm_|pypi-AgE|pplx-|r8_)[A-Za-z0-9_\-]{16,}"),
     re.compile(r"(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"),
-    re.compile(r"(?i)([\"']?(?:api_?key|access_token|refresh_token|id_token|client_secret|"
+    re.compile(r"(?i)([\"']?(?:api[_-]?key|access_token|refresh_token|id_token|client_secret|"
                r"authorization|x-api-key|password)[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]{8,}"),
 ]
 
@@ -80,7 +80,7 @@ _registered: set[str] = set()
 _registered_lock = threading.Lock()
 # Variables that hold an endpoint, whose user-info or credential parameters are secret.
 _URL_NAME = re.compile(r"(?:_URL|_URI|_ENDPOINT|_HOST)$")
-_SECRET_PARAM = re.compile(r"(?i)^(?:api_?key|apikey|key|token|access_token|refresh_token|client_secret|"
+_SECRET_PARAM = re.compile(r"(?i)^(?:api[_-]?key|apikey|key|token|access_token|refresh_token|client_secret|"
                            r"sig|signature|password|auth|secret)$")
 
 

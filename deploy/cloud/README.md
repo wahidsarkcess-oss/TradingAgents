@@ -55,17 +55,24 @@ that the quick and deep models and the parallel analysts share:
 
 | Variable | Start value | What happens at the limit |
 |---|---|---|
-| `TRADINGAGENTS_MAX_LLM_CALLS` | 40 | The next call is refused. Failed requests and SDK retries count. |
+| `TRADINGAGENTS_MAX_LLM_CALLS` | 40 | The next call or retry is refused. Failed requests and retries count. |
 | `TRADINGAGENTS_MAX_TOKENS` | 4096 | Output limit per call (too low truncates reasoning models). |
 | `TRADINGAGENTS_MAX_TOKENS_PER_RUN` | 200000 | A call that could push the run past it is refused. |
-| `TRADINGAGENTS_MAX_COST_PER_RUN` / `_PER_DAY` | unset | Estimated USD; needs a pricing file (below). |
+| `TRADINGAGENTS_MAX_COST_PER_RUN` / `_PER_DAY` | unset | Estimated USD; needs a pricing file (below). The per-run figure covers the analysis and its reflections together. |
+| `TRADINGAGENTS_MAX_EXTERNAL_REQUESTS` | unset | TypeSafe screening requests per run (each retry counts). Under a cost limit none are sent. |
 | `TRADINGAGENTS_MAX_REFLECTION_CALLS` / `_TOKENS` | unset (= the analysis values) | Reflections on past decisions use their own allowance, so a backlog of them never starves an analysis. A refused reflection still records the decision's outcome (it is scored), without the lesson text, and the run says so. |
 
-An SDK retry is checked like a call before it is sent, so the call limit holds
-exactly. A checkpointed analysis keeps its usage beside the checkpoint, so
-resuming it continues from what it already spent; a resume whose usage record is
-missing or damaged is refused while a limit is set (`--clear-checkpoints` starts
-fresh). TypeSafe screening, a paid API outside the LLM clients, is counted and is
+With limits on, a provider retry is checked like a call before it is sent, so the
+call limit holds exactly: the OpenAI and Anthropic SDKs' retries are intercepted,
+and Google's and Bedrock's own retries are switched off and made by the
+TradingAgents wrappers instead (`TRADINGAGENTS_LLM_MAX_RETRIES` of them, each
+approved by the budget). A checkpointed analysis keeps its usage beside the
+checkpoint, including every reservation in flight, written before the request is
+sent: a run killed mid-call is resumed with that reservation counted as spent. A
+resume whose usage record is missing, incomplete or malformed is refused while a
+limit is set (`--clear-checkpoints` starts fresh), and a checkpoint that another
+process is already running is refused rather than resumed twice. TypeSafe
+screening, a paid API outside the LLM clients, is counted per request attempt and
 skipped entirely while a cost limit is set.
 
 A refused call stops the run with **exit code 3** and a usage summary; any other
@@ -87,9 +94,14 @@ records `llm_usage`, which keeps three figures apart:
 With a cost limit set, the run refuses to start if the file is missing, invalid,
 dated in the future, older than `TRADINGAGENTS_MAX_PRICING_AGE_DAYS` (90), or
 missing a model; if `TRADINGAGENTS_MAX_TOKENS` is unset (a reply's cost would
-have no upper bound); or if a tier uses a provider whose usage reporting cannot
-be relied on (`chatgpt`, `ollama`, `openai_compatible`) or any provider at a
-custom endpoint (a relay or proxy URL). A run also stops if a provider returns a response with no token
+have no upper bound); if a tier uses a provider whose usage reporting cannot be
+relied on or verified (`chatgpt`, `ollama`, `openai_compatible`, `bedrock`); or if
+a constructed client targets anything but its provider's official endpoint (a
+relay set in config, an `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` override, an
+Azure API gateway, or an endpoint that cannot be determined). Reservations are
+priced at the highest rate that can apply: a long-context tier whenever the
+prompt could exceed its threshold, and the cache-write rate for providers that
+charge for prompt-cache writes. A run also stops if a provider returns a response with no token
 usage, since its spend can no longer be bounded. **Also set a hard spending limit
 in your provider's billing settings**: these limits are local estimates.
 

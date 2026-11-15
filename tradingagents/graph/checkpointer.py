@@ -38,6 +38,14 @@ def thread_id(ticker: str, date: str, signature: str = "") -> str:
     return hashlib.sha256(base.encode()).hexdigest()[:16]
 
 
+def usage_path(data_dir: str | Path, ticker: str, date: str, signature: str = "") -> Path:
+    """Where a checkpointed analysis keeps its LLM usage, so a resume continues it."""
+    safe = safe_ticker_component(ticker).upper()
+    p = Path(data_dir) / "checkpoints"
+    p.mkdir(parents=True, exist_ok=True)
+    return p / f"{safe}.{thread_id(ticker, date, signature)}.usage.json"
+
+
 @contextmanager
 def get_checkpointer(data_dir: str | Path, ticker: str) -> Generator[SqliteSaver, None, None]:
     """Context manager yielding a SqliteSaver backed by a per-ticker DB."""
@@ -79,11 +87,15 @@ def clear_all_checkpoints(data_dir: str | Path) -> int:
     for db in dbs:
         for path in (db, *cp_dir.glob(f"{db.name}-*")):
             path.unlink(missing_ok=True)
+    # The usage records belong to the checkpoints just removed.
+    for record in cp_dir.glob("*.usage.json"):
+        record.unlink(missing_ok=True)
     return len(dbs)
 
 
 def clear_checkpoint(data_dir: str | Path, ticker: str, date: str, signature: str = "") -> None:
     """Remove checkpoint for a specific ticker+date by deleting the thread's rows."""
+    usage_path(data_dir, ticker, date, signature).unlink(missing_ok=True)
     db = _db_path(data_dir, ticker)
     if not db.exists():
         return

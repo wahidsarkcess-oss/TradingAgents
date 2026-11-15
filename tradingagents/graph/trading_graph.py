@@ -15,17 +15,33 @@ from tradingagents.dataflows.date_window import get_current_date, is_historical
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_tier_client, tier_provider
-from tradingagents.llm_clients.budget import BUDGET_CONFIG_KEYS, RunBudget
+from tradingagents.llm_clients.budget import (
+    BUDGET_CONFIG_KEYS,
+    LLMBudgetExceeded,
+    RunBudget,
+    bind_owner as _bind_budget_owner,
+    current_account as _budget_owner,
+    reset_owner as _reset_budget_owner,
+    settlement_scope,
+)
+from tradingagents.logsafe import register_url_secrets
 from tradingagents.memory import TradingMemoryLog, settlement
 from tradingagents.memory.reflection import Reflector
 from tradingagents.reporting import write_report_tree
 
-from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
+from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id, usage_path
 from .conditional_logic import ConditionalLogic
 from .propagation import Propagator
 from .setup import GraphSetup
 
 logger = logging.getLogger(__name__)
+
+
+def _tier_endpoint(config: dict, tier: str) -> str | None:
+    """The endpoint a tier's client is built with, as ``create_tier_client`` resolves it."""
+    if tier_provider(config, tier) == (config.get("llm_provider") or "").lower():
+        return config.get(f"{tier}_think_backend_url") or config.get("backend_url")
+    return config.get(f"{tier}_think_backend_url")
 
 
 def _validate_trade_date(trade_date) -> str:
@@ -80,15 +96,22 @@ class TradingAgentsGraph:
         # One budget for every LLM call the graph makes, both tiers and the
         # analysts running in parallel. Built first: a cost limit without valid
         # prices for these models fails here, before any model is called.
-        tiers = {tier: (tier_provider(self.config, tier), self.config[f"{tier}_think_llm"])
+        tiers = {tier: (tier_provider(self.config, tier), self.config[f"{tier}_think_llm"],
+                        _tier_endpoint(self.config, tier))
                  for tier in ("deep", "quick")}
+        # Credentials a configured endpoint carries never reach the logs.
+        for _, _, endpoint in tiers.values():
+            register_url_secrets(endpoint)
         self.budget = RunBudget.from_config(self.config, list(tiers.values()))
         self.deep_thinking_llm = create_tier_client(
-            self.config, "deep", callbacks=[*self.callbacks, self.budget.callback(*tiers["deep"])]
+            self.config, "deep", callbacks=[*self.callbacks, self.budget.callback(*tiers["deep"][:2])]
         ).get_llm()
         self.quick_thinking_llm = create_tier_client(
-            self.config, "quick", callbacks=[*self.callbacks, self.budget.callback(*tiers["quick"])]
+            self.config, "quick", callbacks=[*self.callbacks, self.budget.callback(*tiers["quick"][:2])]
         ).get_llm()
+        # Set by begin_checkpoint when it has already started this run's budget
+        # account (fresh, or restored from the checkpoint's saved usage).
+        self._budget_prepared = False
 
         self.memory_log = TradingMemoryLog(self.config)
 
@@ -223,6 +246,20 @@ class TradingAgentsGraph:
             self.config["data_cache_dir"], company_name, str(trade_date), signature
         )
         self._resuming = step is not None
+        # The analysis's LLM usage lives beside its checkpoint: a resume continues
+        # from what was already spent instead of a fresh allowance (refused when
+        # the record is missing or unreadable and a limit is set).
+        budget = getattr(self, "budget", None)
+        if budget is not None:
+            record = usage_path(self.config["data_cache_dir"], company_name, str(trade_date), signature)
+            if not self._resuming:
+                record.unlink(missing_ok=True)
+            try:
+                budget.begin_run(persist_path=record, restore=self._resuming)
+            except LLMBudgetExceeded:
+                self.end_checkpoint()
+                raise
+            self._budget_prepared = True
         if step is not None:
             logger.info("Resuming from step %d for %s on %s", step, company_name, trade_date)
         else:
@@ -241,6 +278,7 @@ class TradingAgentsGraph:
 
     def end_checkpoint(self):
         """Restore the plain uncheckpointed graph after a checkpointed run."""
+        self._budget_prepared = False
         if self._checkpointer_ctx is not None:
             self._checkpointer_ctx.__exit__(None, None, None)
             self._checkpointer_ctx = None
@@ -310,8 +348,12 @@ class TradingAgentsGraph:
         """
         trade_date = _validate_trade_date(trade_date)
         # Limits are per analysis: a backtest reuses one graph over many runs.
+        # begin_checkpoint may already have started (or restored) this run's account.
         if getattr(self, "budget", None) is not None:
-            self.budget.begin_run()
+            if getattr(self, "_budget_prepared", False):
+                self._budget_prepared = False
+            else:
+                self.budget.begin_run()
         return self.propagator.create_initial_state(
             company_name,
             trade_date,
@@ -334,9 +376,14 @@ class TradingAgentsGraph:
         try:
             # Another run settling the same log does the work; this one goes on.
             done = self.settle_all_pending(wait=False)
+            notes = []
             if done.failed:
-                note = (f"{len(done.failed)} past decision(s) could not be settled this run "
-                        "and stay pending.")
+                notes.append(f"{len(done.failed)} past decision(s) could not be settled this run "
+                             "and stay pending.")
+            if done.unreflected:
+                notes.append(f"{len(done.unreflected)} past decision(s) were settled without a reflection: "
+                             "the reflection allowance was used up.")
+            note = " ".join(notes)
         except Exception as exc:
             logger.warning("Settling past decisions failed: %s", exc)
             note = f"Past decisions could not be settled this run ({type(exc).__name__}); they stay pending."
@@ -357,7 +404,7 @@ class TradingAgentsGraph:
         analyzing a ticker (a backtest sweep, a scheduled job) calls this to
         settle it now. Returns what was settled and what failed.
         """
-        with run_config(self.config):
+        with run_config(self.config), self._settlement_budget():
             return settlement.settle_pending(company_name, self.memory_log, self.reflector, self.config)
 
     def settle_all_pending(self, wait: bool = True) -> settlement.Settlement:
@@ -367,8 +414,22 @@ class TradingAgentsGraph:
         otherwise keep its decisions pending, and their lessons out of later runs.
         With ``wait=False`` a pass already running on the same log is not waited for.
         """
-        with run_config(self.config):
+        with run_config(self.config), self._settlement_budget():
             return settlement.settle_all_pending(self.memory_log, self.reflector, self.config, wait=wait)
+
+    @contextmanager
+    def _settlement_budget(self):
+        """Reflections draw on the settlement allowance, apart from the analysts' calls.
+
+        Inside a run (the Memory Log step) that is the run's own settlement
+        allowance; called on its own (after a backtest grid, from a scheduler) it
+        is a fresh account, so it never inherits what the last analysis left.
+        """
+        budget = getattr(self, "budget", None)
+        if budget is not None and _budget_owner() is None:
+            budget.begin_run()
+        with settlement_scope():
+            yield
 
     def record_decision(self, company_name, trade_date, final_state):
         """Record a finished run: its state log, and its decision in the memory log
@@ -397,6 +458,26 @@ class TradingAgentsGraph:
 
         # None resumes an existing checkpoint; init_agent_state starts fresh (#1249).
         graph_input = self.checkpoint_input(init_agent_state)
+        budget = getattr(self, "budget", None)
+        account = budget.current if budget is not None else None
+        # Every call the graph makes, in any worker thread, belongs to this run;
+        # once it ends, a call still coming from it is refused, not charged to the next.
+        token = _bind_budget_owner(account) if account is not None else None
+        try:
+            final_state = self._execute(graph_input, args)
+        finally:
+            if token is not None:
+                _reset_budget_owner(token)
+                budget.end_run(account)
+
+        self.record_decision(company_name, trade_date, final_state)
+
+        # Clear checkpoint on successful completion to avoid stale state.
+        self.clear_checkpoint_on_success(company_name, trade_date, asset_type, portfolio)
+
+        return final_state, run_rating(final_state)
+
+    def _execute(self, graph_input, args):
         if self.debug:
             # A state repeats the messages before it, so each prints once (#1027).
             final_state, printed = {}, set()
@@ -410,13 +491,7 @@ class TradingAgentsGraph:
                     final_state.update(state)
         else:
             final_state = self.graph.invoke(graph_input, **args)
-
-        self.record_decision(company_name, trade_date, final_state)
-
-        # Clear checkpoint on successful completion to avoid stale state.
-        self.clear_checkpoint_on_success(company_name, trade_date, asset_type, portfolio)
-
-        return final_state, run_rating(final_state)
+        return final_state
 
     def stream_run(self, graph_input, **args):
         """Stream a run as ``(messages, state)`` pairs.
@@ -434,6 +509,10 @@ class TradingAgentsGraph:
         # when the process-wide config has changed since. Each step runs in the
         # run's context, so the caller keeps its own between steps.
         context = run_config_context(self.config)
+        budget = getattr(self, "budget", None)
+        account = budget.current if budget is not None else None
+        if account is not None:
+            context.run(_bind_budget_owner, account)
         stream = context.run(self.graph.stream, graph_input, subgraphs=True, **args)
         try:
             while (step := context.run(next, stream, None)) is not None:
@@ -448,6 +527,8 @@ class TradingAgentsGraph:
                     yield chunk.get("messages", []), chunk
         finally:
             context.run(stream.close)
+            if account is not None:
+                budget.end_run(account)
 
     def usage(self, session: bool = False) -> dict:
         """LLM calls, tokens and cost of the current run, or of every run this graph made."""

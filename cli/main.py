@@ -15,7 +15,7 @@ from tradingagents.backtest import iter_grid, run_backtest, summarize
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients.budget import LLMBudgetExceeded, describe_usage
 from tradingagents.llm_clients.openai_client import SIGNED_IN_PROVIDERS
-from tradingagents.logsafe import redact, redaction_scope, scrub_exception
+from tradingagents.logsafe import redact, redaction_scope, safe_exception
 from tradingagents.portfolio import load_portfolio
 
 # prompt_toolkit's win32 output module is importable only on Windows (it asserts
@@ -65,7 +65,8 @@ def _safe_output() -> Iterator[None]:
     Log output is always redacted; without a terminal (a scheduled or cloud run,
     whose output lands in log files) stdout and stderr are too. A spending limit
     ends the run with a summary and exit code 3. Any other error propagates as
-    before, with secrets scrubbed from its message (and no locals printed).
+    before, with secrets scrubbed from its message (and no locals printed); one
+    whose message cannot be scrubbed in place is replaced by a ``RedactedError``.
     """
     unattended = not (sys.stdin and sys.stdin.isatty())
     with redaction_scope(streams=unattended):
@@ -78,8 +79,10 @@ def _safe_output() -> Iterator[None]:
         except _CLI_CONTROL_FLOW:
             raise
         except Exception as exc:
-            scrub_exception(exc)
-            raise
+            safe = safe_exception(exc)
+            if safe is exc:
+                raise
+            raise safe from None
 
 
 @app.callback(invoke_without_command=True)
@@ -214,6 +217,8 @@ def backtest(
             console.print(f"[yellow]failed:[/yellow] {ticker} {date}: {escape(redact(reason))}")
         for ticker, reason in result.settlement_failures:
             console.print(f"[yellow]unsettled:[/yellow] {ticker}: {escape(redact(reason))}")
+        for ticker, reason in getattr(result, "unreflected", []):
+            console.print(f"[yellow]settled without a reflection:[/yellow] {ticker}: {escape(redact(reason))}")
         if getattr(result, "usage", None):
             console.print(f"LLM usage: {escape(describe_usage(result.usage))}")
         if getattr(result, "stopped_reason", None):
@@ -230,13 +235,14 @@ def login(plan: Annotated[Plan, typer.Argument(help="The plan to sign in with")]
     """Sign in with your ChatGPT Plus or Pro plan, for the chatgpt provider."""
     from tradingagents.llm_clients import chatgpt_auth
 
-    try:
-        # One unwrapped line, so the sign-in address can be copied whole.
-        email = chatgpt_auth.sign_in(
-            say=lambda line: console.print(line, soft_wrap=True, markup=False, highlight=False))
-    except chatgpt_auth.ChatGPTAuthError as exc:
-        console.print(f"[red]{escape(str(exc))}[/red]")
-        raise typer.Exit(code=1) from None
+    with _safe_output():
+        try:
+            # One unwrapped line, so the sign-in address can be copied whole.
+            email = chatgpt_auth.sign_in(
+                say=lambda line: console.print(line, soft_wrap=True, markup=False, highlight=False))
+        except chatgpt_auth.ChatGPTAuthError as exc:
+            console.print(f"[red]{escape(redact(str(exc)))}[/red]")
+            raise typer.Exit(code=1) from None
     console.print(f"[green]Signed in to ChatGPT as {escape(email)}.[/green]")
 
 
@@ -245,7 +251,8 @@ def logout(plan: Annotated[Plan, typer.Argument(help="The plan to sign out of")]
     """Sign out of your ChatGPT plan: revoke this machine's access and forget it."""
     from tradingagents.llm_clients import chatgpt_auth
 
-    outcome = chatgpt_auth.sign_out()
+    with _safe_output():
+        outcome = chatgpt_auth.sign_out()
     if outcome == "revoked":
         console.print("Signed out of ChatGPT.")
     elif outcome == "forgotten":

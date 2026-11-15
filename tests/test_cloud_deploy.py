@@ -189,3 +189,52 @@ def test_secrets_are_excluded_from_the_docker_build_context():
     for pattern in ("**/.env*", "data", "secrets", "**/secrets.env", "**/*.secrets.env",
                     "**/chatgpt-auth.json", "**/*.pem", "**/*.key", "deploy/cloud/cloud.env"):
         assert pattern in patterns, pattern
+
+
+@pytest.mark.unit
+@needs_sh
+def test_the_entrypoint_accepts_only_credential_names(tmp_path, fake_cli):
+    """Review L3: a secrets file could set PATH, LD_PRELOAD or raise a spending limit."""
+    probe = fake_cli / "tradingagents"
+    probe.write_text(
+        "#!/bin/sh\n"
+        'for v in LD_PRELOAD PYTHONPATH TRADINGAGENTS_MAX_LLM_CALLS HOME_DIR_TOKEN AWS_ACCESS_KEY_ID '
+        'AWS_BEARER_TOKEN_BEDROCK MY_SERVICE_PASSWORD NOT_A_CREDENTIAL; do\n'
+        '  eval "val=\\${$v+set}"; echo "$v=${val:-unset}"\n'
+        "done\n"
+        'case "$PATH" in /evil*) echo "PATH=hijacked" ;; *) echo "PATH=intact" ;; esac\n'
+    )
+    secrets = (
+        "LD_PRELOAD=/tmp/evil.so\n"
+        "PYTHONPATH=/tmp/evil\n"
+        "PATH=/evil/bin\n"
+        "TRADINGAGENTS_MAX_LLM_CALLS=99999\n"
+        "NOT_A_CREDENTIAL=value\n"
+        "HOME_DIR_TOKEN=abcdefgh\n"  # scan-secrets: allow (fixture)
+        "AWS_ACCESS_KEY_ID=AKIDEXAMPLE\n"
+        "AWS_BEARER_TOKEN_BEDROCK=bedrock-token\n"
+        "MY_SERVICE_PASSWORD=pw-value\n"  # scan-secrets: allow (fixture)
+    )
+    result = _run_entrypoint(tmp_path, fake_cli, secrets)
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    for refused in ("LD_PRELOAD", "PYTHONPATH", "TRADINGAGENTS_MAX_LLM_CALLS", "NOT_A_CREDENTIAL"):
+        assert f"{refused}=unset" in out
+    for accepted in ("HOME_DIR_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_BEARER_TOKEN_BEDROCK", "MY_SERVICE_PASSWORD"):
+        assert f"{accepted}=set" in out
+    assert "PATH=intact" in out
+    assert "/tmp/evil" not in result.stderr        # names are reported, values never
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("path, ignored", [
+    ("data/chatgpt-auth.json", True), ("data/memory/log.md", True),
+    ("tests/data/fixture.csv", False), ("tradingagents/data/x.py", False),
+    ("secrets/key.txt", True), ("deploy/secrets/readme.md", False),
+])
+def test_data_and_secrets_folders_are_ignored_only_at_the_root(path, ignored):
+    """Review L8: data/ used to match at any depth."""
+    if shutil.which("git") is None or not (ROOT / ".git").exists():
+        pytest.skip("needs a git checkout")
+    result = subprocess.run(["git", "check-ignore", "--no-index", "-q", path], cwd=ROOT)
+    assert (result.returncode == 0) is ignored, path

@@ -27,11 +27,11 @@ from tradingagents.agents.structured import invoke_structured
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph import trading_graph
 from tradingagents.llm_clients.budget import (
-    CHARS_PER_TOKEN,
+    BYTES_PER_TOKEN,
     LLMBudgetExceeded,
     PricingError,
     RunBudget,
-    _message_chars,
+    _message_bytes,
     describe_usage,
     load_pricing,
 )
@@ -156,7 +156,7 @@ def test_parallel_callers_share_one_thread_safe_budget():
 
 @pytest.mark.unit
 def test_the_token_limit_counts_provider_reported_usage_and_reserves_the_next_call():
-    hundred_tokens = "x" * (100 * CHARS_PER_TOKEN)
+    hundred_tokens = "x" * (100 * BYTES_PER_TOKEN)
     budget = RunBudget(max_tokens=1000, output_reservation=100)
     cb = budget.callback("openai", "quick-model")
     _call(cb, prompt=hundred_tokens, usage=(600, 200))  # 800 counted
@@ -166,7 +166,7 @@ def test_the_token_limit_counts_provider_reported_usage_and_reserves_the_next_ca
     _call(at_limit, prompt=hundred_tokens, usage=(600, 200))
     _call(at_limit, prompt=hundred_tokens)              # 800 + 100 + 100 = exactly 1000: allowed
     with pytest.raises(LLMBudgetExceeded) as refused:
-        _call(cb, prompt=hundred_tokens + "x" * CHARS_PER_TOKEN)   # 800 + 101 + 100 > 1000
+        _call(cb, prompt=hundred_tokens + "x" * BYTES_PER_TOKEN)   # 800 + 101 + 100 > 1000
     assert refused.value.scope == "tokens"
 
 
@@ -174,7 +174,7 @@ def test_the_token_limit_counts_provider_reported_usage_and_reserves_the_next_ca
 def test_a_response_without_usage_is_counted_at_an_estimate_labelled_as_such():
     budget = RunBudget(max_tokens=10_000)
     cb = budget.callback("openai", "quick-model")
-    _call(cb, prompt="x" * (100 * CHARS_PER_TOKEN), usage=None)
+    _call(cb, prompt="x" * (100 * BYTES_PER_TOKEN), usage=None)
     tokens = budget.summary()["tokens"]
     assert tokens["provider_reported_input"] == 0
     assert tokens["estimated_unreported"] >= 100
@@ -226,7 +226,8 @@ def test_doubtful_pricing_fails_closed(tmp_path, change, message):
     data.update(change)
     path.write_text(json.dumps(data))
     with pytest.raises(PricingError, match=message):
-        RunBudget.from_config(_config(tmp_path, max_cost_per_day_usd=1.0, pricing_file=str(path)), MODELS)
+        RunBudget.from_config(_config(tmp_path, max_cost_per_day_usd=1.0, max_tokens=100,
+                                      pricing_file=str(path)), MODELS)
 
 
 @pytest.mark.unit
@@ -251,7 +252,7 @@ def test_the_run_cost_limit_refuses_a_call_whose_worst_case_would_pass_it(tmp_pa
     cfg = _config(tmp_path, max_cost_per_run_usd=1.0, max_tokens=100, pricing_file=str(_pricing(tmp_path)))
     budget = RunBudget.from_config(cfg, MODELS)
     cb = budget.callback("openai", "quick-model")
-    ten_tokens = "x" * (10 * CHARS_PER_TOKEN)
+    ten_tokens = "x" * (10 * BYTES_PER_TOKEN)
     _call(cb, prompt=ten_tokens, usage=(300, 300))      # 0.3 + 0.6 = $0.90
     assert budget.summary()["cost_usd"]["estimated"] == pytest.approx(0.9)
     with pytest.raises(LLMBudgetExceeded) as refused:   # reserves 10 in + 100 out = $0.21
@@ -277,7 +278,7 @@ def test_estimated_and_provider_reported_costs_are_kept_apart(tmp_path):
 
 @pytest.mark.unit
 def test_missing_usage_under_a_cost_limit_stops_every_later_call(tmp_path):
-    cfg = _config(tmp_path, max_cost_per_run_usd=100.0, pricing_file=str(_pricing(tmp_path)))
+    cfg = _config(tmp_path, max_cost_per_run_usd=100.0, max_tokens=100, pricing_file=str(_pricing(tmp_path)))
     budget = RunBudget.from_config(cfg, MODELS)
     cb = budget.callback("openai", "quick-model")
     _call(cb, usage=None)
@@ -293,7 +294,7 @@ def test_missing_usage_under_a_cost_limit_stops_every_later_call(tmp_path):
 def test_failed_requests_are_charged_their_input_estimate(tmp_path):
     cfg = _config(tmp_path, pricing_file=str(_pricing(tmp_path)))
     budget = RunBudget.from_config(cfg, MODELS)
-    _call(budget.callback("openai", "quick-model"), prompt="x" * (100 * CHARS_PER_TOKEN), fail=True)
+    _call(budget.callback("openai", "quick-model"), prompt="x" * (100 * BYTES_PER_TOKEN), fail=True)
     summary = budget.summary()
     assert summary["cost_usd"]["charged_against_limits"] == pytest.approx(100 * 1000 / 1e6)
     assert summary["tokens"]["estimated_unreported"] == 100
@@ -315,7 +316,7 @@ def test_the_daily_limit_holds_across_runs_through_its_ledger(tmp_path):
 
 @pytest.mark.unit
 def test_an_unreadable_ledger_fails_closed(tmp_path):
-    cfg = _config(tmp_path, max_cost_per_day_usd=1.0, pricing_file=str(_pricing(tmp_path)))
+    cfg = _config(tmp_path, max_cost_per_day_usd=1.0, max_tokens=100, pricing_file=str(_pricing(tmp_path)))
     budget = RunBudget.from_config(cfg, MODELS)
     ledger_dir = tmp_path / "cache" / "spend"
     ledger_dir.mkdir(parents=True)
@@ -360,7 +361,8 @@ def test_the_env_variables_reach_the_config(monkeypatch):
 @pytest.mark.unit
 def test_every_limit_is_off_by_default():
     for key in ("max_llm_calls_per_run", "max_tokens_per_run", "max_cost_per_run_usd",
-                "max_cost_per_day_usd", "pricing_file"):
+                "max_cost_per_day_usd", "max_reflection_calls_per_run", "max_reflection_tokens_per_run",
+                "pricing_file"):
         assert DEFAULT_CONFIG[key] is None
 
 
@@ -401,7 +403,7 @@ class MeteredModel(ScriptedModel):
         if self.usage:
             tokens_in, tokens_out = self.usage
             if tokens_in == "prompt":   # exactly what the budget estimated for the prompt
-                tokens_in = math.ceil(sum(_message_chars(m) for m in messages) / CHARS_PER_TOKEN)
+                tokens_in = math.ceil(sum(_message_bytes(m) for m in messages) / BYTES_PER_TOKEN)
             result.generations[0].message.usage_metadata = {
                 "input_tokens": tokens_in, "output_tokens": tokens_out,
                 "total_tokens": tokens_in + tokens_out}
@@ -410,9 +412,9 @@ class MeteredModel(ScriptedModel):
 
 def _graph(tmp_path, monkeypatch, model, **config):
     cfg = copy.deepcopy(DEFAULT_CONFIG)
-    cfg.update(results_dir=str(tmp_path / "results"), data_cache_dir=str(tmp_path / "cache"),
-               memory_log_path=str(tmp_path / "log.md"), llm_provider="openai",
-               quick_think_llm="quick-model", deep_think_llm="deep-model", **config)
+    cfg.update({"results_dir": str(tmp_path / "results"), "data_cache_dir": str(tmp_path / "cache"),
+                "memory_log_path": str(tmp_path / "log.md"), "llm_provider": "openai",
+                "quick_think_llm": "quick-model", "deep_think_llm": "deep-model", **config})
     # Each tier gets its own copy carrying the callbacks the graph attaches, as a
     # real client would; the copies share one call list.
     monkeypatch.setattr(trading_graph, "create_tier_client",

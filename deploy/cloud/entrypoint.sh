@@ -9,6 +9,10 @@
 #
 # Format: one NAME=value per line; blank lines and # comments are ignored; a
 # value may be wrapped in double quotes. The value is never evaluated by a shell.
+# Only credential names are accepted (*_API_KEY, *_KEY, *_TOKEN, *_SECRET,
+# *_PASSWORD, AWS_ACCESS_KEY_ID, AWS_BEARER_TOKEN_BEDROCK); anything else, such as
+# PATH, LD_PRELOAD, PYTHONPATH or a TRADINGAGENTS_* setting (which could raise a
+# spending limit), is skipped: settings belong in cloud.env.
 set -eu
 
 secrets_file="${TRADINGAGENTS_SECRETS_FILE:-/run/secrets/tradingagents.env}"
@@ -32,6 +36,14 @@ if [ -f "$secrets_file" ]; then
         case "$name" in
             '' | [0-9]* | *[!A-Za-z0-9_]*)
                 echo "entrypoint: skipped a secrets line with an invalid name" >&2
+                continue ;;
+            TRADINGAGENTS_* | PYTHON* | LD_* | PATH | HOME | SHELL | IFS | ENV | BASH_ENV)
+                echo "entrypoint: skipped $name: only credentials belong in the secrets file" >&2
+                continue ;;
+            *_API_KEY | *_KEY | *_TOKEN | *_SECRET | *_PASSWORD | AWS_ACCESS_KEY_ID | AWS_BEARER_TOKEN_BEDROCK)
+                ;;
+            *)
+                echo "entrypoint: skipped $name: only credentials belong in the secrets file" >&2
                 continue ;;
         esac
         value=${line#*=}

@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 from tradingagents.agents.context import resolve_instrument_identity
+from tradingagents.llm_clients.budget import LLMBudgetExceeded, meter_external_requests
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,12 @@ def jev_screen(ticker: str):
     instrument = f"{name} ({ticker})" if name else ticker
 
     def screen(posts: list[str]) -> tuple[list[bool], str]:
+        # TypeSafe is a paid API outside the LLM clients: count its requests in the
+        # run's budget, and skip it while a cost limit is set (it cannot be priced).
+        try:
+            meter_external_requests("TypeSafe screening", len(posts))
+        except LLMBudgetExceeded as exc:
+            return _unscreened(instrument, posts, f"skipped: {exc}")
         try:
             answers = _ask_each(instrument, posts)
             keep = [a["about"]["noul"] >= _OFF_TOPIC_BELOW for a in answers]

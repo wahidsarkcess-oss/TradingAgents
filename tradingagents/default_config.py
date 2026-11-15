@@ -30,6 +30,8 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MAX_TOKENS_PER_RUN":   "max_tokens_per_run",
     "TRADINGAGENTS_MAX_COST_PER_RUN":     "max_cost_per_run_usd",
     "TRADINGAGENTS_MAX_COST_PER_DAY":     "max_cost_per_day_usd",
+    "TRADINGAGENTS_MAX_REFLECTION_CALLS":  "max_reflection_calls_per_run",
+    "TRADINGAGENTS_MAX_REFLECTION_TOKENS": "max_reflection_tokens_per_run",
     "TRADINGAGENTS_PRICING_FILE":         "pricing_file",
     "TRADINGAGENTS_MAX_PRICING_AGE_DAYS": "max_pricing_age_days",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
@@ -136,10 +138,17 @@ def build_default_config() -> dict:
         # are the provider-reported counts, estimated where a provider reports none.
         "max_llm_calls_per_run": None,
         "max_tokens_per_run": None,
+        # Reflections on past decisions (the Memory Log step, backtest settlement)
+        # draw on an allowance of their own; unset, each takes the analysis value
+        # above as a separate pool. Their cost counts in the session and daily totals.
+        "max_reflection_calls_per_run": None,
+        "max_reflection_tokens_per_run": None,
         # Cost limits are estimates from pricing_file (USD per 1M tokens, copied
         # from the provider's pricing page) and fail closed: with a cost limit set,
         # a run will not start unless that file is valid, no older than
-        # max_pricing_age_days, and prices every model in use.
+        # max_pricing_age_days, and prices every model in use; max_tokens is set;
+        # and every tier is a provider whose client honours max_tokens and reports
+        # usage, at its official endpoint (llm_clients/budget.py, COST_LIMIT_PROVIDERS).
         "max_cost_per_run_usd": None,
         "max_cost_per_day_usd": None,
         "pricing_file": None,

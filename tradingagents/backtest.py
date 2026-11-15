@@ -85,6 +85,8 @@ class BacktestResult:
     skipped: int = 0
     failures: list[tuple[str, str, str]] = field(default_factory=list)
     settlement_failures: list[tuple[str, str]] = field(default_factory=list)
+    # Settled and scored, but without a reflection: the budget refused it.
+    unreflected: list[tuple[str, str]] = field(default_factory=list)
     # Why the sweep stopped before its last cell (a spending limit), else None.
     stopped_reason: str | None = None
     # LLM calls, tokens and cost over the whole sweep (see llm_clients/budget.py).
@@ -115,6 +117,8 @@ class BacktestSummary:
     by_rating: dict[str, RatingScore]
     unscored: int = 0
     holding: str = ""
+    # Resolved and scored above, but settled without a reflection (budget refusal).
+    unreflected: int = 0
 
     def render(self) -> str:
         lines = [f"Resolved cells: {self.resolved} · pending: {self.pending}"
@@ -126,6 +130,9 @@ class BacktestSummary:
                 f"- {rating}: n={score.count}, {called}, "
                 f"mean alpha {score.mean_alpha:+.2%} vs the benchmark"
             )
+        if self.unreflected:
+            lines.append(f"{self.unreflected} of the resolved cells were settled without a reflection "
+                         "(the reflection allowance was used up); their outcomes are scored above.")
         lines.append("")
         if self.pending:
             lines.append("Pending cells are not scored above; re-run to settle them.")
@@ -217,13 +224,20 @@ def run_backtest(
             result.failures.append((ticker, date, str(exc)))
 
     # Settlement runs at the start of the next run for a ticker, so each ticker's
-    # last cell would stay pending without this pass.
+    # last cell would stay pending without this pass. It starts a fresh budget
+    # account, so it never inherits the allowance the last cell left over.
+    if budget is not None:
+        budget.begin_run()
     for ticker in tickers:
         try:
             settlement = graph.settle_pending(ticker)
             result.settlement_failures.extend(
                 (failed_ticker, f"{date}: {reason}")
                 for failed_ticker, date, reason in settlement.failed
+            )
+            result.unreflected.extend(
+                (unreflected_ticker, f"{date}: {reason}")
+                for unreflected_ticker, date, reason in getattr(settlement, "unreflected", [])
             )
         except Exception as exc:  # reflection calls an LLM; one failure is not the sweep's
             logger.warning("Settling %s failed: %s", ticker, exc)
@@ -262,4 +276,5 @@ def summarize(source: BacktestResult | str | Path) -> BacktestSummary:
     return BacktestSummary(resolved=len(resolved),
                            pending=len(entries) - len(resolved) - unscored,
                            by_rating=by_rating, unscored=unscored,
-                           holding=", ".join(sorted(windows)) or "the configured window")
+                           holding=", ".join(sorted(windows)) or "the configured window",
+                           unreflected=sum(1 for e, _ in resolved if not (e.get("reflection") or "").strip()))

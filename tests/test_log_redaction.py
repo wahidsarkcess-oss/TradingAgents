@@ -48,10 +48,10 @@ def test_known_credential_shapes_are_masked_even_when_not_in_the_environment(sec
 
 @pytest.mark.unit
 @pytest.mark.parametrize("text, kept", [
-    ("Authorization: Bearer abcdefghijklmnop1234", "Bearer ***"),
+    ("Authorization: Bearer abcdefghijklmnop1234", "Bearer ***"),  # scan-secrets: allow (fixture)
     ("GET https://www.alphavantage.co/query?function=X&apikey=ABCDEF123456", "&apikey=***"),
     ("https://api.example.com/v1?token=sekret-value-123&x=1", "?token=***&x=1"),
-    ('{"refresh_token": "rt_abcdefghijklmnop"}', '"refresh_token": "***'),
+    ('{"refresh_token": "rt_abcdefghijklmnop"}', '"refresh_token": "***'),  # scan-secrets: allow (fixture)
 ])
 def test_bearer_tokens_query_keys_and_json_tokens_are_masked(text, kept):
     out = logsafe.redact(text)

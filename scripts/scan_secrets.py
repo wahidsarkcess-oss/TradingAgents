@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import hashlib
+import posixpath
 import re
 import subprocess
 import sys
@@ -143,16 +144,17 @@ def _forbidden(path: str) -> str | None:
 
 def in_tests(path: str) -> bool:
     """Whether ``path`` lies under the repository's top-level ``tests/`` directory,
-    the only place inline exemptions count. Relative paths are taken from the
+    the only place inline exemptions count. The path is normalised first, so
+    ``tests/../app/x.py`` is not under tests/. Relative paths are taken from the
     repository root (as git and pre-commit give them); an absolute path counts
     only when it is inside the current directory's ``tests/``."""
-    candidate = Path(path)
-    if candidate.is_absolute():
+    text = path.replace("\\", "/")
+    if PurePosixPath(text).is_absolute() or Path(path).is_absolute():
         try:
-            candidate = candidate.resolve().relative_to(Path.cwd().resolve())
+            text = Path(path).resolve().relative_to(Path.cwd().resolve()).as_posix()
         except ValueError:
             return False
-    parts = PurePosixPath(str(candidate).replace("\\", "/")).parts
+    parts = PurePosixPath(posixpath.normpath(text)).parts
     return len(parts) > 1 and parts[0] == "tests"
 
 

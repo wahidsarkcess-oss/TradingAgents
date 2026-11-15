@@ -307,7 +307,11 @@ def test_a_lock_file_cleared_away_is_retaken_fresh(tmp_path, monkeypatch, offlin
     graph.end_checkpoint()
     clear_all_checkpoints(tmp_path / "cache")                   # removes the now-unheld lock file
     graph.begin_checkpoint("NVDA", TRADE_DATE)
-    assert graph._usage_lock_file.exists()                      # held on a file that still exists
+    record = trading_graph.usage_path(graph.config["data_cache_dir"], "NVDA", TRADE_DATE,
+                                      graph._run_signature("stock"))
+    assert Path(f"{record}.lock").exists()                      # held on a file that still exists
+    with pytest.raises(LLMBudgetExceeded):
+        _checkpoint_graph(tmp_path, monkeypatch, max_llm_calls_per_run=10).begin_checkpoint("NVDA", TRADE_DATE)
     graph.end_checkpoint()
 
 

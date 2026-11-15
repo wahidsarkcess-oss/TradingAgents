@@ -6,6 +6,7 @@ Per-ticker SQLite databases so concurrent tickers don't contend.
 from __future__ import annotations
 
 import hashlib
+import logging
 import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -14,6 +15,8 @@ from pathlib import Path
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from tradingagents.dataflows.symbols import safe_ticker_component
+
+logger = logging.getLogger(__name__)
 
 
 def _db_path(data_dir: str | Path, ticker: str) -> Path:
@@ -95,24 +98,116 @@ def clear_all_checkpoints(data_dir: str | Path) -> int:
     return len(dbs)
 
 
-def remove_stale_lock(lock_file: Path) -> bool:
-    """Delete a checkpoint's lock file if no process holds it; True when removed.
+class CheckpointLock:
+    """An exclusive, non-blocking lock on a checkpoint's ``<record>.lock`` file.
 
-    The file is deleted while this process holds its lock, so no other holder
-    exists at that moment; a run that opened the old file just before is told by
-    its own check (TradingAgentsGraph._lock_usage_record) that it vanished.
+    Held by one run at a time, across threads, graph objects and processes on
+    one host. After locking, the locked file is checked to still be the file at
+    the path (same device and inode where the platform reports them): a lock
+    taken on a file that was deleted and replaced in between (a concurrent
+    ``--clear-checkpoints``) would be a lock no one else sees, so it is released
+    and taken again on the current file. Like any file lock, it is not reliable
+    on network filesystems.
     """
-    from tradingagents.dataflows.files import locked
 
-    record = str(lock_file)[: -len(".lock")]
-    holder = locked(record, wait=False)
+    attempts = 3
+
+    def __init__(self, record: str | Path):
+        self.path = Path(f"{record}.lock")
+        self._handle = None
+        self._hold = None
+
+    @property
+    def held(self) -> bool:
+        return self._handle is not None
+
+    def _open(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        return open(self.path, "a+b")
+
+    @staticmethod
+    def _lock(handle):
+        """Enter a non-blocking hold on ``handle``; (acquired, hold)."""
+        import os
+
+        from tradingagents.dataflows.files import _hold_posix, _hold_windows
+
+        hold = (_hold_windows if os.name == "nt" else _hold_posix)(handle, False)
+        return hold.__enter__(), hold
+
+    def _is_current(self, handle) -> bool:
+        import os
+
+        try:
+            path_stat = os.stat(self.path)
+        except FileNotFoundError:
+            return False
+        held = os.fstat(handle.fileno())
+        if held.st_ino and path_stat.st_ino:
+            return (held.st_dev, held.st_ino) == (path_stat.st_dev, path_stat.st_ino)
+        return True     # the platform reports no file identity: existence is all we can check
+
+    def acquire(self) -> bool:
+        """Take the lock; False when another holder has it."""
+        for _ in range(self.attempts):
+            handle = self._open()
+            acquired, hold = self._lock(handle)
+            if not acquired:
+                hold.__exit__(None, None, None)
+                handle.close()
+                return False
+            if self._is_current(handle):
+                self._handle, self._hold = handle, hold
+                return True
+            # Replaced while we took it: let go of the orphan and try the current file.
+            try:
+                hold.__exit__(None, None, None)
+            finally:
+                handle.close()
+        return False
+
+    def release(self, remove_file: bool = False) -> None:
+        """Release the lock; with ``remove_file``, first try to delete the lock file.
+
+        The file is deleted while still held, so no other holder exists at that
+        moment. Where the platform refuses to delete an open file (Windows), the
+        file is simply left: a leftover lock file is harmless, and the lock is
+        released regardless.
+        """
+        if self._handle is None:
+            return
+        try:
+            if remove_file:
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:          # e.g. Windows: the file is open
+                    logger.debug("Left checkpoint lock file %s in place (%s)", self.path.name,
+                                 type(exc).__name__)
+        finally:
+            try:
+                self._hold.__exit__(None, None, None)
+            finally:
+                self._handle.close()
+                self._handle = self._hold = None
+
+
+def remove_stale_lock(lock_file: Path) -> bool:
+    """Delete a checkpoint's lock file if no process holds it; True when it is gone.
+
+    Never touches a lock a live run holds, and never raises because a file could
+    not be deleted.
+    """
+    lock = CheckpointLock(str(lock_file)[: -len(".lock")])
     try:
-        if not holder.__enter__():
+        if not lock.acquire():
             return False                 # an active run holds it: leave it
-        lock_file.unlink(missing_ok=True)
-        return True
-    finally:
-        holder.__exit__(None, None, None)
+    except OSError as exc:
+        logger.debug("Could not inspect checkpoint lock file %s (%s)", lock_file.name, type(exc).__name__)
+        return False
+    lock.release(remove_file=True)
+    return not lock_file.exists()
 
 
 def clear_checkpoint(data_dir: str | Path, ticker: str, date: str, signature: str = "") -> None:

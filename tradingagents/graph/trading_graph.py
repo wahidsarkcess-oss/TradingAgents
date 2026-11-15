@@ -2,8 +2,10 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,6 @@ from tradingagents.agents.context import build_instrument_context, resolve_instr
 from tradingagents.agents.rating import run_rating
 from tradingagents.dataflows.config import run_config, run_config_context, set_config
 from tradingagents.dataflows.date_window import get_current_date, is_historical
-from tradingagents.dataflows.files import locked
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_tier_client, tier_provider
@@ -34,7 +35,14 @@ from tradingagents.memory import TradingMemoryLog, settlement
 from tradingagents.memory.reflection import Reflector
 from tradingagents.reporting import write_report_tree
 
-from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id, usage_path
+from .checkpointer import (
+    CheckpointLock,
+    checkpoint_step,
+    clear_checkpoint,
+    get_checkpointer,
+    thread_id,
+    usage_path,
+)
 from .conditional_logic import ConditionalLogic
 from .propagation import Propagator
 from .setup import GraphSetup
@@ -45,6 +53,37 @@ logger = logging.getLogger(__name__)
 # checkpoint's saved usage) for the run create_run_state is about to build. Kept
 # in the caller's context, so concurrent runs on one graph never share it.
 _prepared_account: ContextVar = ContextVar("tradingagents_prepared_account", default=None)
+
+
+@dataclass(eq=False)
+class _CheckpointRun:
+    """What one checkpointed run acquired, so it releases exactly that and no more."""
+
+    lock: CheckpointLock | None = None   # its checkpoint's lock
+    checkpointer: object = None          # its entered get_checkpointer context
+    remove_lock_file: bool = False       # its checkpoint was cleared on success
+
+
+# The checkpointed runs of the calling context, as (graph id, run) entries: each
+# begin_checkpoint that succeeds pushes its run, and the matching end_checkpoint
+# releases that run only. A begin_checkpoint that fails removes just its own
+# entry, so nothing can release another run's resources. Immutable, so a copied
+# context never shares changes.
+_checkpoint_runs: ContextVar = ContextVar("tradingagents_checkpoint_runs", default=())
+
+
+def _own_run(graph) -> _CheckpointRun | None:
+    """The calling context's most recent checkpointed run on ``graph``."""
+    for graph_id, run in reversed(_checkpoint_runs.get()):
+        if graph_id == id(graph):
+            return run
+    return None
+
+
+def _drop_run(run: _CheckpointRun) -> None:
+    _checkpoint_runs.set(tuple(entry for entry in _checkpoint_runs.get() if entry[1] is not run))
+# Makes "is a checkpointed run active on this graph?" and claiming it one step.
+_claim_lock = threading.Lock()
 
 
 def _tier_endpoint(config: dict, tier: str) -> str | None:
@@ -122,9 +161,8 @@ class TradingAgentsGraph:
         # before any call.
         self.budget.register_clients([(tiers["deep"][0], tiers["deep"][1], self.deep_thinking_llm),
                                       (tiers["quick"][0], tiers["quick"][1], self.quick_thinking_llm)])
-        self._usage_lock = None
-        self._usage_lock_file = None
-        self._remove_usage_lock_file = False
+        # The checkpointed run whose saver self.graph is compiled with, if any.
+        self._active_checkpoint = None
 
         self.memory_log = TradingMemoryLog(self.config)
 
@@ -268,47 +306,60 @@ class TradingAgentsGraph:
         lived only inside ``propagate`` and the CLI streamed the checkpointer-less
         graph, making the flag a no-op.
         """
-        self._resuming = False
         if not self.config.get("checkpoint_enabled"):
+            self._resuming = False
             return None
         signature = self._run_signature(asset_type, portfolio)
         budget = getattr(self, "budget", None)
         record = usage_path(self.config["data_cache_dir"], company_name, str(trade_date), signature)
-        # The checkpoint is this run's alone from here on (see _lock_usage_record),
-        # before its database is even opened.
-        if budget is not None:
-            try:
-                self._lock_usage_record(record, budget)
-            except LLMBudgetExceeded:
+        run = _CheckpointRun()
+        # One checkpointed run per graph object under limits: self.graph and its
+        # saver belong to that run. A second is refused here, before it acquires
+        # or changes anything. (With limits off it runs, as it always has.)
+        with _claim_lock:
+            active = getattr(self, "_active_checkpoint", None)
+            if active is not None and budget is not None and budget.limited:
                 self._abandon_unused_owner(budget)
-                raise
-        self._checkpointer_ctx = get_checkpointer(self.config["data_cache_dir"], company_name)
-        saver = self._checkpointer_ctx.__enter__()
-        self.graph = self.workflow.compile(checkpointer=saver)
+                raise LLMBudgetExceeded(
+                    "checkpoint_in_progress", "this graph is already running a checkpointed analysis; "
+                    "use a separate TradingAgentsGraph for each concurrent checkpointed run", {})
+            self._active_checkpoint = run
+        _checkpoint_runs.set((*_checkpoint_runs.get(), (id(self), run)))
+        try:
+            # The checkpoint is this run's alone from here on, before its
+            # database is even opened (see _lock_usage_record).
+            if budget is not None:
+                run.lock = self._lock_usage_record(record, budget)
+            run.checkpointer = get_checkpointer(self.config["data_cache_dir"], company_name)
+            saver = run.checkpointer.__enter__()
+            self._checkpointer_ctx = run.checkpointer
+            self.graph = self.workflow.compile(checkpointer=saver)
 
-        step = checkpoint_step(
-            self.config["data_cache_dir"], company_name, str(trade_date), signature
-        )
-        self._resuming = step is not None
-        # The analysis's LLM usage lives beside its checkpoint: a resume continues
-        # from what was already spent instead of a fresh allowance (refused when
-        # the record is missing or unreadable and a limit is set).
-        if budget is not None:
-            try:
+            step = checkpoint_step(
+                self.config["data_cache_dir"], company_name, str(trade_date), signature
+            )
+            self._resuming = step is not None
+            # The analysis's LLM usage lives beside its checkpoint: a resume continues
+            # from what was already spent instead of a fresh allowance (refused when
+            # the record is missing or unreadable and a limit is set).
+            if budget is not None:
                 if not self._resuming:
                     record.unlink(missing_ok=True)
                 account = budget.begin_run(persist_path=record, restore=self._resuming)
-            except LLMBudgetExceeded:
+                # An account create_run_state already started for this run (the CLI
+                # order) made no calls; this one replaces it.
+                earlier = _budget_owner()
+                if earlier is not None and earlier.budget is budget and earlier is not account:
+                    budget.end_run(earlier, completed=True)
+                _bind_budget_owner(account)
+                _prepared_account.set(account)
+        except BaseException as exc:
+            # Undo only what this call acquired; nothing of another run's.
+            if isinstance(exc, LLMBudgetExceeded) and budget is not None:
                 self._abandon_unused_owner(budget)
-                self.end_checkpoint()
-                raise
-            # An account create_run_state already started for this run (the CLI
-            # order) made no calls; this one replaces it.
-            earlier = _budget_owner()
-            if earlier is not None and earlier.budget is budget and earlier is not account:
-                budget.end_run(earlier, completed=True)
-            _bind_budget_owner(account)
-            _prepared_account.set(account)
+            _drop_run(run)
+            self._release_checkpoint_run(run)
+            raise
         if step is not None:
             logger.info("Resuming from step %d for %s on %s", step, company_name, trade_date)
         else:
@@ -333,63 +384,67 @@ class TradingAgentsGraph:
             budget.end_run(earlier, completed=True)
             _bind_budget_owner(None)
 
-    def _lock_usage_record(self, record: Path, budget) -> None:
-        """Hold the checkpoint's usage record for this run alone (until end_checkpoint).
+    def _lock_usage_record(self, record: Path, budget) -> CheckpointLock | None:
+        """Lock the checkpoint for this run alone (released by its end_checkpoint).
 
         Two processes resuming one checkpoint would each continue its usage and
         together get twice the allowance, so with limits on the second is refused.
-        One graph object holds one checkpoint lock at a time: a second checkpointed
-        run on the same instance is refused under limits (with limits off it runs,
-        as before, without taking a lock), so it can never replace, and so release,
-        the first run's lock.
+        With limits off a held lock is not waited for: the run goes ahead unlocked,
+        as before locks existed.
         """
-        if getattr(self, "_usage_lock", None) is not None:
-            if budget.limited:
-                raise LLMBudgetExceeded(
-                    "checkpoint_in_progress", "this graph is already running a checkpointed analysis; "
-                    "use a separate TradingAgentsGraph for each concurrent checkpointed run", {})
-            return
-        lock_file = Path(f"{record}.lock")
-        for _ in range(3):
-            holder = locked(record, wait=False)
-            if not holder.__enter__():
-                holder.__exit__(None, None, None)
-                break
-            if lock_file.exists():
-                self._usage_lock, self._usage_lock_file = holder, lock_file
-                return
-            # Cleared away while we took it: the lock is on a file no one else
-            # opens any more. Take the fresh one instead.
-            holder.__exit__(None, None, None)
+        lock = CheckpointLock(record)
+        if lock.acquire():
+            return lock
         if budget.limited:
             raise LLMBudgetExceeded("resume_in_progress", "another process is already running this "
                                     "checkpoint; resuming it twice would double its LLM allowance", {})
+        return None
 
     def end_checkpoint(self):
-        """Restore the plain uncheckpointed graph after a checkpointed run."""
+        """Release what this context's own checkpointed run acquired, and only that.
+
+        Called after a begin_checkpoint that failed (or in a context that never
+        began one), it releases nothing, so it can never free another run's lock or
+        close its checkpoint database.
+        """
         # The run's budget binding ends with the run (create_run_state and
         # begin_checkpoint set it in the caller's context).
         _prepared_account.set(None)
         _bind_budget_owner(None)
-        if getattr(self, "_usage_lock", None) is not None:
-            # A run whose checkpoint was cleared removes its lock file while it still
-            # holds the lock, so no other process can be holding that file.
-            if getattr(self, "_remove_usage_lock_file", False):
-                self._usage_lock_file.unlink(missing_ok=True)
-            self._usage_lock.__exit__(None, None, None)
-            self._usage_lock = None
-        self._remove_usage_lock_file = False
-        if self._checkpointer_ctx is not None:
-            self._checkpointer_ctx.__exit__(None, None, None)
-            self._checkpointer_ctx = None
-            self.graph = self.workflow.compile()
-        self._resuming = False
+        run = _own_run(self)
+        if run is not None:
+            _drop_run(run)
+            self._release_checkpoint_run(run)
+
+    def _release_checkpoint_run(self, run: _CheckpointRun) -> None:
+        """Release one run's lock and database; each step runs even if one before failed."""
+        try:
+            if run.lock is not None:
+                run.lock.release(remove_file=run.remove_lock_file)
+        finally:
+            run.lock = None
+            try:
+                if run.checkpointer is not None:
+                    run.checkpointer.__exit__(None, None, None)
+            finally:
+                run.checkpointer = None
+                with _claim_lock:
+                    if getattr(self, "_active_checkpoint", None) is run:
+                        self._active_checkpoint = None
+                        self._checkpointer_ctx = None
+                        self.graph = self.workflow.compile()
+                        self._resuming = False
 
     @contextmanager
     def checkpoint_scope(self, company_name, trade_date, asset_type: str = "stock", portfolio=None):
-        """Context-manager form of begin/end_checkpoint for the propagate path."""
+        """Context-manager form of begin/end_checkpoint for the propagate path.
+
+        begin_checkpoint runs outside the try: when it fails it has already undone
+        its own work, and there is nothing of this run for end_checkpoint to release.
+        """
+        thread_id_value = self.begin_checkpoint(company_name, trade_date, asset_type, portfolio)
         try:
-            yield self.begin_checkpoint(company_name, trade_date, asset_type, portfolio)
+            yield thread_id_value
         finally:
             self.end_checkpoint()
 
@@ -400,7 +455,10 @@ class TradingAgentsGraph:
                 self.config["data_cache_dir"], company_name, str(trade_date),
                 self._run_signature(asset_type, portfolio),
             )
-            self._remove_usage_lock_file = True
+            # The run's lock file goes too, deleted while the run still holds it.
+            run = _own_run(self)
+            if run is not None:
+                run.remove_lock_file = True
 
     def run_settings(self) -> dict:
         """What produces this graph's runs, for the saved report and state log.

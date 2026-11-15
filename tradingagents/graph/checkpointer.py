@@ -90,7 +90,29 @@ def clear_all_checkpoints(data_dir: str | Path) -> int:
     # The usage records belong to the checkpoints just removed.
     for record in cp_dir.glob("*.usage.json"):
         record.unlink(missing_ok=True)
+    for lock_file in cp_dir.glob("*.usage.json.lock"):
+        remove_stale_lock(lock_file)
     return len(dbs)
+
+
+def remove_stale_lock(lock_file: Path) -> bool:
+    """Delete a checkpoint's lock file if no process holds it; True when removed.
+
+    The file is deleted while this process holds its lock, so no other holder
+    exists at that moment; a run that opened the old file just before is told by
+    its own check (TradingAgentsGraph._lock_usage_record) that it vanished.
+    """
+    from tradingagents.dataflows.files import locked
+
+    record = str(lock_file)[: -len(".lock")]
+    holder = locked(record, wait=False)
+    try:
+        if not holder.__enter__():
+            return False                 # an active run holds it: leave it
+        lock_file.unlink(missing_ok=True)
+        return True
+    finally:
+        holder.__exit__(None, None, None)
 
 
 def clear_checkpoint(data_dir: str | Path, ticker: str, date: str, signature: str = "") -> None:

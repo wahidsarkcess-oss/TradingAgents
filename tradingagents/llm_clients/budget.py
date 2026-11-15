@@ -66,6 +66,11 @@ spend plus every open reservation. A process that dies mid-call leaves its
 reservation counted for the rest of the day. The ledger is per cache directory;
 file locks are not reliable on network filesystems.
 
+**Not tamper-resistant.** The ledger and the per-checkpoint usage records are
+plain local files: anyone who can write to them can lower the figures, and the
+budget cannot detect it. Limits guard against runaway spending, not against
+someone with write access to the data directory.
+
 **Estimates.** A reservation is the estimated prompt tokens plus the output limit,
 priced at the highest input rate that can apply: the long-context rate when the
 prompt could exceed its threshold (a token is never shorter than one UTF-8 byte),
@@ -818,6 +823,7 @@ class RunBudget:
         provider's official one.
         """
         self.clients = tuple((p.lower(), m, client_endpoint(llm)) for p, m, llm in clients)
+        self._client_objects = tuple((p.lower(), m, llm) for p, m, llm in clients)
         if self.cost_limited:
             _require_actual_endpoints(self.clients)
 
@@ -834,14 +840,43 @@ class RunBudget:
         _require_cost_limit_support(self.pricing, self.models,
                                     self.output_reservation if self.output_limited else None)
         _require_actual_endpoints(self.clients)
-        if any(not retry_hook_installed(p) and SDK_OF_PROVIDER.get(p, "openai") in ("openai", "anthropic")
-               for p, _, _ in self.clients):
-            install_retry_hooks()
-            if any(not retry_hook_installed(p) and SDK_OF_PROVIDER.get(p, "openai") in ("openai", "anthropic")
-                   for p, _, _ in self.clients):
-                raise PricingError("a total cost limit needs retries routed through the budget, and the "
-                                   "SDK in use could not be hooked; set llm_max_retries to 0 at graph creation")
+        self._route_retries_through_budget()
         self.max_session_cost = limit
+
+    def _route_retries_through_budget(self) -> None:
+        """Make every registered client's retries go through the budget, or refuse.
+
+        For a limit added after the clients were built (a backtest's --max-cost on
+        a graph made without limits). OpenAI and Anthropic SDK retries are hooked.
+        A Google client still retrying inside its SDK is switched, at runtime, to
+        one SDK attempt per call with the same number of retries made by the
+        wrapper through the budget, and the switch is read back. Anything that
+        cannot be switched and verified raises ``PricingError`` before any request.
+        """
+        install_retry_hooks()
+        for provider, model, llm in getattr(self, "_client_objects", ()):
+            sdk = SDK_OF_PROVIDER.get(provider, "openai")
+            if sdk in ("openai", "anthropic"):
+                if not retry_hook_installed(provider):
+                    raise PricingError(f"a total cost limit needs {provider}:{model}'s retries routed through "
+                                       "the budget, and its SDK could not be hooked; build the graph with "
+                                       "llm_max_retries=0 or with the limit in its config")
+            elif sdk == "google":
+                if getattr(llm, "budget_retries", None) is None:
+                    try:
+                        attempts = int(llm.max_retries)
+                        llm.budget_retries = max(0, attempts - 1)   # the same number of retries
+                        llm.max_retries = 1                          # one attempt inside the SDK
+                    except Exception as exc:  # noqa: BLE001 — anything unexpected: refuse
+                        raise PricingError(f"could not route {provider}:{model}'s retries through the budget "
+                                           f"({type(exc).__name__}); build the graph with the limit in its "
+                                           "config") from None
+                if getattr(llm, "budget_retries", None) is None or getattr(llm, "max_retries", None) != 1:
+                    raise PricingError(f"{provider}:{model} still retries inside its SDK, out of the budget's "
+                                       "sight; build the graph with the limit in its config")
+            else:
+                raise PricingError(f"a total cost limit cannot control {provider}'s retries at runtime; "
+                                   "build the graph with the limit in its config")
 
     def callback(self, provider: str, model: str) -> BudgetCallback:
         """The callback handler to attach to the client of ``provider:model``."""
@@ -1151,7 +1186,10 @@ class RunBudget:
                 t.estimated_unreported += reservation.input_estimate
             estimated = retry_cost if reservation.price else None
             self._charge(totals, estimated, None)
-            account.save()
+            # The retry's charge must be on disk before it is sent, or a crash during
+            # it would lose the charge: under limits, an unsaved retry is refused.
+            if not account.save() and self.limited:
+                self._refuse("usage_record", account.broken or "usage record not saved", account)
 
     def _external(self, account: RunAccount, service: str, requests: int) -> None:
         with self._lock:

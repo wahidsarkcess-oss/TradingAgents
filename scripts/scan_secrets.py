@@ -142,8 +142,18 @@ def _forbidden(path: str) -> str | None:
 
 
 def in_tests(path: str) -> bool:
-    """Whether ``path`` lies under a ``tests/`` directory, where inline exemptions count."""
-    return "tests" in PurePosixPath(path.replace("\\", "/")).parts[:-1]
+    """Whether ``path`` lies under the repository's top-level ``tests/`` directory,
+    the only place inline exemptions count. Relative paths are taken from the
+    repository root (as git and pre-commit give them); an absolute path counts
+    only when it is inside the current directory's ``tests/``."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        try:
+            candidate = candidate.resolve().relative_to(Path.cwd().resolve())
+        except ValueError:
+            return False
+    parts = PurePosixPath(str(candidate).replace("\\", "/")).parts
+    return len(parts) > 1 and parts[0] == "tests"
 
 
 def scan_line(line: str) -> list[tuple[str, str]]:

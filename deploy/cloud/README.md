@@ -121,6 +121,13 @@ runs cannot jointly pass `TRADINGAGENTS_MAX_COST_PER_DAY`. Scope and limits:
 - an unreadable or unwritable ledger stops every later call while a cost limit is
   set, and is logged as an error otherwise. It is never overwritten or reset.
 
+**Not tamper-resistant.** The daily ledger and the per-checkpoint usage records
+are ordinary local files. Anyone who can write to the data volume can edit them
+to a lower figure (or clear the checkpoints and start a fresh allowance), and the
+budget cannot tell. They guard against runaway spending, not against someone with
+write access; the hard limit in your provider's billing settings is the control
+that holds against that.
+
 ## 3. Run
 
 ```bash

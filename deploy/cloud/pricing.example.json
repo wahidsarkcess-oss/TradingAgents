@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy to pricing.json and fill in from your provider's official pricing page. Prices are USD per 1 million tokens. Keys are 'provider:model-id' as TradingAgents names them (or a bare model id). This template is rejected as-is (null prices, placeholder date), so cost limits fail closed until it is filled in. cached_input_per_mtok may stay null: cached input is then charged at the full input rate. For a provider with no per-token bill (chatgpt plan, a local ollama), write 0 explicitly.",
+  "currency": "USD",
+  "as_of": "YYYY-MM-DD",
+  "source": "URL of the pricing page these prices were copied from",
+  "models": {
+    "provider:quick-model-id": {
+      "input_per_mtok": null,
+      "output_per_mtok": null,
+      "cached_input_per_mtok": null
+    },
+    "provider:deep-model-id": {
+      "input_per_mtok": null,
+      "output_per_mtok": null,
+      "cached_input_per_mtok": null
+    }
+  }
+}

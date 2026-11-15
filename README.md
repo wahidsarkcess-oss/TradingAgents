@@ -328,6 +328,22 @@ The CLI takes the same content as a JSON file: `tradingagents --portfolio my_boo
 
 An empty `positions` list means a flat book, which is different from passing nothing. A run without a portfolio is never treated as flat.
 
+## Spending limits and cloud runs
+
+Every LLM call of an analysis draws on one shared budget, checked before the request is sent. All limits are off unless you set them:
+
+```bash
+TRADINGAGENTS_MAX_LLM_CALLS=40          # calls per analysis, failed requests and SDK retries included
+TRADINGAGENTS_MAX_TOKENS=4096           # output tokens per call
+TRADINGAGENTS_MAX_TOKENS_PER_RUN=200000 # provider-reported tokens per analysis
+TRADINGAGENTS_MAX_COST_PER_RUN=0.50     # estimated USD; needs TRADINGAGENTS_PRICING_FILE
+TRADINGAGENTS_MAX_COST_PER_DAY=5        # estimated USD per UTC day, across runs
+```
+
+A refused call ends the run with exit code 3. Cost limits are estimates from a pricing file you fill in from your provider's pricing page (template: `deploy/cloud/pricing.example.json`), and they fail closed: with one set, a run does not start unless that file is valid, recent and prices every model in use. Each saved state log records `llm_usage`, which keeps provider-reported tokens, the estimated cost and any provider-reported cost apart. `tradingagents backtest ... --max-cost 10` caps a whole sweep. These are local estimates; set a hard limit in your provider's billing settings too.
+
+`deploy/cloud/` runs one unattended analysis in a hardened container: keys come through a Docker secret, output is redacted, there is no update check and no TTY, and nothing is scheduled. See [deploy/cloud/README.md](deploy/cloud/README.md). Secrets are kept out of commits by `scripts/scan_secrets.py`, which runs in CI and as an opt-in pre-commit hook (`pre-commit install`).
+
 ## Persistence and Recovery
 
 TradingAgents persists two kinds of state across runs.

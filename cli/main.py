@@ -1,4 +1,6 @@
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from enum import StrEnum
 from typing import Annotated
 
@@ -11,7 +13,9 @@ from cli.prompts import filter_analysts_for_asset_type, parse_analysts
 from cli.run import run_analysis
 from tradingagents.backtest import iter_grid, run_backtest, summarize
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.llm_clients.budget import LLMBudgetExceeded, describe_usage
 from tradingagents.llm_clients.openai_client import SIGNED_IN_PROVIDERS
+from tradingagents.logsafe import redact, redaction_scope, scrub_exception
 from tradingagents.portfolio import load_portfolio
 
 # prompt_toolkit's win32 output module is importable only on Windows (it asserts
@@ -30,7 +34,52 @@ app = typer.Typer(
     name="TradingAgents",
     help="TradingAgents CLI: Multi-Agents LLM Financial Trading Framework",
     add_completion=True,  # Enable shell completion
+    # A traceback's local variables can hold API keys (config dicts, clients,
+    # the key prompt), so they are never printed.
+    pretty_exceptions_show_locals=False,
 )
+
+# A budget stop exits with its own code, so a scheduler can tell it from a crash.
+BUDGET_EXIT_CODE = 3
+
+# The CLI's own control flow (exit codes, aborts, bad parameters) passes through
+# _safe_output untouched. Typer ships these itself in newer releases and
+# re-exports click's in older ones.
+_CLI_CONTROL_FLOW: tuple[type[BaseException], ...] = tuple(
+    cls for cls in (typer.Exit, typer.Abort, getattr(typer, "TyperException", None),
+                    getattr(typer, "BadParameter", None))
+    if isinstance(cls, type)
+)
+try:  # pragma: no cover - depends on the typer release
+    import click
+
+    _CLI_CONTROL_FLOW += (click.exceptions.ClickException, click.exceptions.Exit, click.exceptions.Abort)
+except ImportError:
+    pass
+
+
+@contextmanager
+def _safe_output() -> Iterator[None]:
+    """Run a command with its output kept free of secrets.
+
+    Log output is always redacted; without a terminal (a scheduled or cloud run,
+    whose output lands in log files) stdout and stderr are too. A spending limit
+    ends the run with a summary and exit code 3. Any other error propagates as
+    before, with secrets scrubbed from its message (and no locals printed).
+    """
+    unattended = not (sys.stdin and sys.stdin.isatty())
+    with redaction_scope(streams=unattended):
+        try:
+            yield
+        except LLMBudgetExceeded as exc:
+            console.print(f"[red]Stopped by a spending limit:[/red] {escape(redact(str(exc)))}")
+            console.print(f"[dim]Usage when stopped: {escape(describe_usage(exc.usage))}[/dim]")
+            raise typer.Exit(code=BUDGET_EXIT_CODE) from None
+        except _CLI_CONTROL_FLOW:
+            raise
+        except Exception as exc:
+            scrub_exception(exc)
+            raise
 
 
 @app.callback(invoke_without_command=True)
@@ -90,7 +139,8 @@ def analyze(
 
     try:
         flags = {"ticker": ticker, "date": date, "analysts": analysts, "save": save, "show": show, "html": html}
-        run_analysis(checkpoint=checkpoint, portfolio=portfolio_context, flags=flags)
+        with _safe_output():
+            run_analysis(checkpoint=checkpoint, portfolio=portfolio_context, flags=flags)
     except _NO_CONSOLE_ERRORS:
         # A terminal with no console buffer cannot host the interactive prompts.
         # Emit one actionable line on stderr instead of a prompt_toolkit
@@ -120,6 +170,11 @@ def backtest(
     run_id: str = typer.Option(
         None, "--run-id", help="Continue an earlier sweep: its cells are skipped and its log reused"
     ),
+    max_cost: float = typer.Option(
+        None, "--max-cost",
+        help="Stop the sweep once its estimated LLM spend reaches this many USD; needs "
+             "TRADINGAGENTS_PRICING_FILE, and refuses to start without valid prices",
+    ),
 ):
     """Score past decisions over a grid of tickers and dates."""
 
@@ -144,20 +199,26 @@ def backtest(
         console.print(f"[dim][{done}/{total}] {ticker} {date}[/dim]")
 
     kwargs = {"asset_type": kind.value, "portfolio": book, "run_id": run_id, "progress": show_progress,
-              "selected_analysts": [a.value for a in chosen]}
+              "selected_analysts": [a.value for a in chosen], "max_total_cost_usd": max_cost}
 
-    try:
-        result = run_backtest(names, dates, DEFAULT_CONFIG, **kwargs)
-    except Exception as exc:  # a missing key or an unknown analyst is a setup error
-        console.print(f"[red]{exc}[/red]")
-        raise typer.Exit(code=1) from None
-    console.print(summarize(result).render())
-    console.print(f"\nRan {result.cells_run} cells, skipped {result.skipped}. Log: {result.log_path}")
-    console.print(f"Continue or settle this sweep: --run-id {result.run_id}")
-    for ticker, date, reason in result.failures:
-        console.print(f"[yellow]failed:[/yellow] {ticker} {date}: {reason}")
-    for ticker, reason in result.settlement_failures:
-        console.print(f"[yellow]unsettled:[/yellow] {ticker}: {reason}")
+    with _safe_output():
+        try:
+            result = run_backtest(names, dates, DEFAULT_CONFIG, **kwargs)
+        except Exception as exc:  # a missing key, an unknown analyst or missing prices is a setup error
+            console.print(f"[red]{escape(redact(str(exc)))}[/red]")
+            raise typer.Exit(code=1) from None
+        console.print(summarize(result).render())
+        console.print(f"\nRan {result.cells_run} cells, skipped {result.skipped}. Log: {result.log_path}")
+        console.print(f"Continue or settle this sweep: --run-id {result.run_id}")
+        for ticker, date, reason in result.failures:
+            console.print(f"[yellow]failed:[/yellow] {ticker} {date}: {escape(redact(reason))}")
+        for ticker, reason in result.settlement_failures:
+            console.print(f"[yellow]unsettled:[/yellow] {ticker}: {escape(redact(reason))}")
+        if getattr(result, "usage", None):
+            console.print(f"LLM usage: {escape(describe_usage(result.usage))}")
+        if getattr(result, "stopped_reason", None):
+            console.print(f"[red]Sweep stopped early:[/red] {escape(redact(result.stopped_reason))}")
+            raise typer.Exit(code=BUDGET_EXIT_CODE)
 
 
 # The plans `login` and `logout` take: the providers signed in to, not keyed.

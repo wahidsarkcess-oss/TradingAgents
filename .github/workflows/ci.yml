@@ -65,3 +65,15 @@ jobs:
         # The repo is fully clean under the strict select, so we lint everything
         # (generated results/ is excluded via pyproject extend-exclude).
         run: ruff check .
+
+  secret-scan:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Scan tracked files for API keys, tokens and credential files
+        # Standard library only; prints file, line and kind, never the value.
+        run: python scripts/scan_secrets.py

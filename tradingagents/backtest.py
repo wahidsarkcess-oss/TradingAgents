@@ -27,6 +27,7 @@ from tradingagents.agents.rating import RATING_REVIEW
 from tradingagents.dataflows.date_window import get_current_date
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.llm_clients.budget import LLMBudgetExceeded
 from tradingagents.memory import TradingMemoryLog
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,15 @@ class BacktestResult:
     skipped: int = 0
     failures: list[tuple[str, str, str]] = field(default_factory=list)
     settlement_failures: list[tuple[str, str]] = field(default_factory=list)
+    # Why the sweep stopped before its last cell (a spending limit), else None.
+    stopped_reason: str | None = None
+    # LLM calls, tokens and cost over the whole sweep (see llm_clients/budget.py).
+    usage: dict = field(default_factory=dict)
+
+
+# Limits that hold for every later cell too, so the sweep stops instead of
+# refusing cell after cell. A per-analysis limit only fails its own cell.
+_SWEEP_STOPPING_SCOPES = {"session_cost", "day_cost", "usage_unreported", "pricing"}
 
 
 # What each rating claims will happen, so an outcome can be scored against it.
@@ -149,6 +159,7 @@ def run_backtest(
     selected_analysts=("market", "social", "news", "fundamentals"),
     run_id: str | None = None,
     progress: Callable[[int, int, str, str], None] | None = None,
+    max_total_cost_usd: float | None = None,
 ) -> BacktestResult:
     """Analyze every ticker on every date, into a memory log of this run's own.
 
@@ -156,6 +167,11 @@ def run_backtest(
     real runs read back. Cells already in this run's log are skipped, so an
     interrupted sweep resumes by being run again. ``progress(done, total,
     ticker, date)`` is called before each cell that runs.
+
+    ``max_total_cost_usd`` caps the estimated LLM spend of the whole sweep. It
+    needs a valid pricing file for every model (it fails closed, raising
+    ``ValueError`` before any cell runs); once reached, the sweep stops and the
+    cells already run are kept, so re-running with ``run_id`` continues it.
     """
     runs = Path(config["results_dir"]) / "backtest"
     if run_id:
@@ -170,6 +186,11 @@ def run_backtest(
                   "memory_log_path": str(run_dir / "trading_memory.md")}
 
     graph = TradingAgentsGraph(selected_analysts, config=run_config)
+    budget = getattr(graph, "budget", None)
+    if budget is not None:
+        budget.set_session_cost_limit(max_total_cost_usd)
+    elif max_total_cost_usd is not None:
+        raise ValueError("this graph has no LLM budget, so a total cost limit cannot be enforced")
     result = BacktestResult(run_id=run_id, log_path=Path(run_config["memory_log_path"]))
     done = {(e["ticker"], e["date"]) for e in graph.memory_log.load_entries()}
 
@@ -184,6 +205,13 @@ def run_backtest(
         try:
             graph.propagate(ticker, date, asset_type, portfolio=portfolio)
             result.cells_run += 1
+        except LLMBudgetExceeded as exc:
+            result.failures.append((ticker, date, str(exc)))
+            if exc.scope in _SWEEP_STOPPING_SCOPES:
+                result.stopped_reason = str(exc)
+                logger.warning("Backtest stopped at %s %s: %s", ticker, date, exc)
+                break
+            logger.warning("Backtest cell %s %s stopped by its limit: %s", ticker, date, exc)
         except Exception as exc:  # one unreachable vendor must not end the sweep
             logger.warning("Backtest cell %s %s failed: %s", ticker, date, exc)
             result.failures.append((ticker, date, str(exc)))
@@ -200,6 +228,7 @@ def run_backtest(
         except Exception as exc:  # reflection calls an LLM; one failure is not the sweep's
             logger.warning("Settling %s failed: %s", ticker, exc)
             result.settlement_failures.append((ticker, str(exc)))
+    result.usage = graph.usage(session=True) if budget is not None else {}
     return result
 
 

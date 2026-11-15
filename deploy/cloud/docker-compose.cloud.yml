@@ -1,0 +1,61 @@
+# One unattended analysis per invocation, on any host that runs Docker.
+#
+#   cd deploy/cloud
+#   cp cloud.env.example cloud.env          # settings and limits (no secrets)
+#   cp secrets.env.example secrets.env      # your key; chmod 600, see README.md
+#   TICKER=NVDA ANALYSIS_DATE=2026-11-13 docker compose -f docker-compose.cloud.yml run --rm analysis
+#
+# There is no schedule, no broker and no order path here: a run writes the same
+# reports as the CLI, into the tradingagents_cloud_data volume.
+name: tradingagents-cloud
+
+services:
+  analysis:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: tradingagents:cloud
+    entrypoint: ["sh", "/home/appuser/app/deploy/cloud/entrypoint.sh"]
+    command:
+      - "--ticker"
+      - "${TICKER:?set TICKER, e.g. TICKER=NVDA}"
+      - "--date"
+      - "${ANALYSIS_DATE:?set ANALYSIS_DATE=YYYY-MM-DD}"
+      - "--analysts"
+      - "${ANALYSTS:-market,news,fundamentals}"
+      - "--save"
+      - "--no-show"
+    # Non-secret settings only. Keys arrive through the secret below.
+    env_file:
+      - cloud.env
+    environment:
+      # Unattended: no update check, caches on tmpfs (the root filesystem is read-only).
+      TRADINGAGENTS_NO_UPDATE_CHECK: "1"
+      XDG_CACHE_HOME: /tmp/cache
+    secrets:
+      - source: tradingagents_secrets
+        target: tradingagents.env
+    volumes:
+      - tradingagents_cloud_data:/home/appuser/.tradingagents
+    # Hardening: no terminal (so no interactive prompts), read-only image,
+    # no Linux capabilities, no privilege escalation, bounded resources.
+    tty: false
+    stdin_open: false
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 256
+    restart: "no"
+
+secrets:
+  tradingagents_secrets:
+    file: ./secrets.env
+
+volumes:
+  tradingagents_cloud_data:

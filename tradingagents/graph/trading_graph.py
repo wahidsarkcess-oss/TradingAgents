@@ -15,6 +15,7 @@ from tradingagents.dataflows.date_window import get_current_date, is_historical
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_tier_client, tier_provider
+from tradingagents.llm_clients.budget import BUDGET_CONFIG_KEYS, RunBudget
 from tradingagents.memory import TradingMemoryLog, settlement
 from tradingagents.memory.reflection import Reflector
 from tradingagents.reporting import write_report_tree
@@ -42,9 +43,10 @@ def _validate_trade_date(trade_date) -> str:
 
 
 # Config keys that do not change what a run writes: where it keeps its files,
-# whether it checkpoints, and how often it retries a provider.
+# whether it checkpoints, how often it retries a provider, and its spending limits.
 _NOT_IN_SIGNATURE = frozenset({
     "results_dir", "data_cache_dir", "memory_log_path", "checkpoint_enabled", "llm_max_retries",
+    *BUDGET_CONFIG_KEYS,
 })
 
 
@@ -75,9 +77,18 @@ class TradingAgentsGraph:
         os.makedirs(self.config["data_cache_dir"], exist_ok=True)
         os.makedirs(self.config["results_dir"], exist_ok=True)
 
-        extra = {"callbacks": self.callbacks} if self.callbacks else {}
-        self.deep_thinking_llm = create_tier_client(self.config, "deep", **extra).get_llm()
-        self.quick_thinking_llm = create_tier_client(self.config, "quick", **extra).get_llm()
+        # One budget for every LLM call the graph makes, both tiers and the
+        # analysts running in parallel. Built first: a cost limit without valid
+        # prices for these models fails here, before any model is called.
+        tiers = {tier: (tier_provider(self.config, tier), self.config[f"{tier}_think_llm"])
+                 for tier in ("deep", "quick")}
+        self.budget = RunBudget.from_config(self.config, list(tiers.values()))
+        self.deep_thinking_llm = create_tier_client(
+            self.config, "deep", callbacks=[*self.callbacks, self.budget.callback(*tiers["deep"])]
+        ).get_llm()
+        self.quick_thinking_llm = create_tier_client(
+            self.config, "quick", callbacks=[*self.callbacks, self.budget.callback(*tiers["quick"])]
+        ).get_llm()
 
         self.memory_log = TradingMemoryLog(self.config)
 
@@ -298,6 +309,9 @@ class TradingAgentsGraph:
         and loads them alongside the analysts (see ``_memory_step``).
         """
         trade_date = _validate_trade_date(trade_date)
+        # Limits are per analysis: a backtest reuses one graph over many runs.
+        if getattr(self, "budget", None) is not None:
+            self.budget.begin_run()
         return self.propagator.create_initial_state(
             company_name,
             trade_date,
@@ -435,6 +449,11 @@ class TradingAgentsGraph:
         finally:
             context.run(stream.close)
 
+    def usage(self, session: bool = False) -> dict:
+        """LLM calls, tokens and cost of the current run, or of every run this graph made."""
+        budget = getattr(self, "budget", None)
+        return budget.summary(session=session) if budget is not None else {}
+
     def _log_state(self, trade_date, final_state):
         """Write a run's final state to JSON under the run's own ticker."""
         entry = {
@@ -463,6 +482,9 @@ class TradingAgentsGraph:
             "final_trade_decision": final_state["final_trade_decision"],
             "final_rating": run_rating(final_state),
             "run_settings": self.run_settings(),
+            # Calls, tokens and cost, with provider-reported figures kept apart
+            # from estimates (see llm_clients/budget.py).
+            "llm_usage": self.usage(),
         }
 
         # A ticker that would escape the results directory is rejected.
